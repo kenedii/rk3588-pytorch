@@ -14,7 +14,7 @@ from rk3588_torch._lib import default_npu  # noqa: E402
 
 class Cfg(ctypes.Structure):
     _fields_ = [(n, ctypes.c_int) for n in ("h", "w", "c", "n", "kh", "kw", "sy", "sx", "pt", "pl", "oh", "ow",
-                                            "grains", "dbanks")]
+                                            "grains", "dbanks", "layout")]
 
 
 npu = default_npu()
@@ -45,25 +45,36 @@ def pack_weights(w, layout, G=16):
     return t.contiguous().to(torch.float16), Np
 
 
-def run(H, W, C, N, k, s=1, p=0, layouts=("yx_c", "xy_c", "c_yx"), grains=0):
+def run(H, W, C, N, k, s=1, p=0, layouts=("c_yx", "yx_c", "xy_c"), grains=0, nc=1):
     torch.manual_seed(0)
     x = torch.randn(1, C, H, W).half().float()
     w = torch.randn(N, C, k, k).half().float()
     ref = F.conv2d(x.double(), w.double(), stride=s, padding=p)[0].permute(1, 2, 0)   # oh, ow, N
     oh, ow = ref.shape[:2]
-    xin = x[0].permute(1, 2, 0).contiguous().half()                                  # H, W, C
+    Cp = (C + 31) // 32 * 32
+    if nc:   # NC1HWC2, C2 = 8 fp16 channels per 16-byte atom
+        xp = torch.zeros(Cp, H, W)
+        xp[:C] = x[0]
+        xin = xp.reshape(Cp // 8, 8, H, W).permute(0, 2, 3, 1).contiguous().half()
+    else:
+        xin = x[0].permute(1, 2, 0).contiguous().half()                              # H, W, C
     res = {}
     for lay in layouts:
         wb, Np = pack_weights(w, lay)
         out = torch.empty(oh, ow, Np, dtype=torch.float32)
-        cfg = Cfg(H, W, C, Np, k, k, s, s, p, p, oh, ow, grains, 0)
+        cfg = Cfg(H, W, Cp if nc else C, Np, k, k, s, s, p, p, oh, ow, grains, 0, nc)
         r = npu.lib.rk_conv_raw(npu.ctx, ctypes.byref(cfg), xin.data_ptr(), wb.data_ptr(), out.data_ptr())
         if r != 0:
             res[lay] = "FAIL " + npu.lib.rk_last_error(npu.ctx).decode()[:60]
             continue
+        poison = (out.view(torch.int32) == 0x7f7f7f7f)
+        if nc:   # output NC1HWC2 fp32: [Np/4][oh][ow][4]
+            out = out.reshape(-1).reshape(Np // 4, oh, ow, 4).permute(1, 2, 0, 3).reshape(oh, ow, Np)
         got = out[:, :, :N].double()
         e = ((got - ref).norm() / ref.norm()).item()
-        res[lay] = f"{e:.1e}"
+        res[lay] = f"{e:.1e}(unwritten {poison.float().mean().item() * 100:.0f}%)"
+        if os.environ.get("DUMP"):
+            print("   out[0,:4,:4]", out[0, :4, :4].tolist(), "\n   ref[0,:4,:4]", ref[0, :4, :4].tolist())
     print(f"H{H} W{W} C{C} N{N} k{k} s{s} p{p} -> oh{oh} ow{ow}: " + "  ".join(f"{k_}={v}" for k_, v in res.items()),
           flush=True)
     return res
@@ -71,6 +82,10 @@ def run(H, W, C, N, k, s=1, p=0, layouts=("yx_c", "xy_c", "c_yx"), grains=0):
 
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "basic"
+    if which == "w1":
+        run(64, 1, 32, 16, 1, layouts=("yx_c",))      # identical to a 64x32x16 matmul
+        run(8, 2, 32, 16, 1, layouts=("yx_c",))
+        run(4, 4, 32, 16, 1, layouts=("yx_c",))
     if which == "basic":
         run(8, 8, 32, 16, 1, layouts=("yx_c",))       # 1x1 conv with width > 1
         run(8, 8, 32, 16, 3)                         # 3x3, no pad

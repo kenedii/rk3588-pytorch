@@ -152,6 +152,14 @@ def _npu_gemm(a, b, precision):
     return out if batched else out[0]
 
 
+def _all_finite(t):
+    """One pass instead of isfinite().all()'s four: any NaN/inf makes the sum non-finite. Only
+    if the sum is non-finite (which a huge-but-finite sum could also cause) do the exact check."""
+    if math.isfinite(t.sum().item()):
+        return True
+    return bool(torch.isfinite(t).all())
+
+
 def _check_sample(a, b, out, precision):
     """Compare a few rows of the NPU result with an fp64 CPU reference."""
     if a.dim() == 3:
@@ -190,8 +198,8 @@ def gemm(a, b, precision=None):
             else:
                 _warn_once("fail", f"NPU GEMM failed ({e}); this call ran on the CPU")
         return _cpu_gemm(a, b)
-    if not torch.isfinite(out).all():
-        if torch.isfinite(a).all() and torch.isfinite(b).all():
+    if not _all_finite(out):
+        if _all_finite(a) and _all_finite(b):
             _verified[key] = False
             _stats["rejected_shapes"] += 1
             _stats["fallbacks"] += 1
@@ -245,6 +253,38 @@ def _mm_backward(ctx, g):
 _rknpu_mm.register_autograd(_mm_backward, setup_context=_mm_setup)
 
 
+# torch.ops.rknpu.linear(x, w, precision) = x @ w.T with dW computed directly in w's layout
+# (going through w.t() would hand autograd a transposed gradient, and PyTorch then makes a
+# full strided copy of every weight gradient to match the parameter's layout)
+@torch.library.custom_op("rknpu::linear", mutates_args=())
+def _rknpu_linear(x: torch.Tensor, w: torch.Tensor, precision: str) -> torch.Tensor:
+    return gemm(x, w.t(), precision)
+
+
+@_rknpu_linear.register_fake
+def _(x, w, precision):
+    return x.new_empty((x.shape[0], w.shape[0]), dtype=torch.float32)
+
+
+def _linear_setup(ctx, inputs, output):
+    x, w, precision = inputs
+    ctx.save_for_backward(x, w)
+    ctx.precision = precision
+
+
+def _linear_backward(ctx, g):
+    x, w = ctx.saved_tensors
+    gx = gw = None
+    if ctx.needs_input_grad[0]:
+        gx = torch.ops.rknpu.mm(g, w, ctx.precision).to(x.dtype)          # dX = dY @ W
+    if ctx.needs_input_grad[1]:
+        gw = torch.ops.rknpu.mm(g.t(), x, ctx.precision).to(w.dtype)      # dW = dY^T @ X, W's layout
+    return gx, gw, None
+
+
+_rknpu_linear.register_autograd(_linear_backward, setup_context=_linear_setup)
+
+
 def _out_dtype(*ts):
     dt = ts[0].dtype
     for t in ts[1:]:
@@ -273,7 +313,7 @@ def matmul2d(a, b):
 
 def linear(x, weight, bias=None):
     shape = x.shape
-    y = torch.ops.rknpu.mm(x.reshape(-1, shape[-1]), weight.t(), _precision).to(_out_dtype(x, weight))
+    y = torch.ops.rknpu.linear(x.reshape(-1, shape[-1]), weight, _precision).to(_out_dtype(x, weight))
     if bias is not None:
         y = y + bias
     return y.reshape(*shape[:-1], weight.shape[0])
@@ -336,21 +376,163 @@ def scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_caus
     return out.reshape(*lead, L, Ev)
 
 
+# ---------------------------------------------------------------------------------------
+# Convolution: native NPU conv (NC1HWC2), guarded like gemm()
+# ---------------------------------------------------------------------------------------
+def _pair(v):
+    return (v, v) if isinstance(v, int) else tuple(v)
+
+
+def conv_supported(x, weight, stride, padding, dilation, groups):
+    st, pd, dl = _pair(stride), _pair(padding), _pair(dilation)
+    if isinstance(padding, str) or groups != 1 or dl != (1, 1) or x.dim() != 4 or weight.dim() != 4:
+        return False
+    kh, kw = weight.shape[2:]
+    return (1 <= st[0] <= 7 and 1 <= st[1] <= 7 and 0 <= pd[0] <= 15 and 0 <= pd[1] <= 15 and kh <= 31 and kw <= 31
+            and x.shape[2] + 2 * pd[0] >= kh and x.shape[3] + 2 * pd[1] >= kw and x.shape[3] <= 2047)
+
+
+def _cpu_conv(x, w, st, pd):
+    t0 = time.perf_counter()
+    out = torch.nn.functional.conv2d(_as_f32(x), _as_f32(w), stride=st, padding=pd)
+    _stats["cpu_time"] += time.perf_counter() - t0
+    _stats["cpu_calls"] += 1
+    _stats["cpu_macs"] += out.numel() * w.shape[1] * w.shape[2] * w.shape[3]
+    return out
+
+
+def _npu_conv(x, w, st, pd, precision):
+    x = _as_f32(x).contiguous()
+    w = _as_f32(w).contiguous()
+    N, C, H, W = x.shape
+    O, _, kh, kw = w.shape
+    oh = (H + 2 * pd[0] - kh) // st[0] + 1
+    ow = (W + 2 * pd[1] - kw) // st[1] + 1
+    y = torch.empty((N, O, oh, ow), dtype=torch.float32)
+    t0 = time.perf_counter()
+    with torch.profiler.record_function("rknpu::conv2d"):
+        default_npu().conv2d(N, C, H, W, x.data_ptr(), O, kh, kw, w.data_ptr(), st[0], st[1], pd[0], pd[1], oh, ow,
+                             y.data_ptr(), False, precision)
+    _stats["npu_time"] += time.perf_counter() - t0
+    _stats["npu_calls"] += 1
+    _stats["npu_macs"] += y.numel() * C * kh * kw
+    return y
+
+
+def conv(x, w, stride=1, padding=0, precision=None):
+    """Guarded conv2d (no bias, groups=1, dilation=1), fp32 result."""
+    global _failures, _enabled
+    precision = precision or _precision
+    if precision not in ("fp16", "bf16"):
+        precision = "fp16"                 # the conv path implements fp16 and bf16
+    st, pd = _pair(stride), _pair(padding)
+    macs = x.shape[0] * w.shape[0] * w.shape[1] * w.shape[2] * w.shape[3] * \
+        ((x.shape[2] + 2 * pd[0] - w.shape[2]) // st[0] + 1) * ((x.shape[3] + 2 * pd[1] - w.shape[3]) // st[1] + 1)
+    if (not _enabled or macs < threshold(precision) or not _usable(x, w) or not npu_available()
+            or not conv_supported(x, w, st, pd, 1, 1)):
+        return _cpu_conv(x, w, st, pd)
+    key = ("conv", tuple(x.shape), tuple(w.shape), st, pd, precision)
+    status = _verified.get(key)
+    if status is False:
+        return _cpu_conv(x, w, st, pd)
+    try:
+        out = _npu_conv(x, w, st, pd, precision)
+    except (RuntimeError, OSError) as e:
+        with _lock:
+            _failures += 1
+            _stats["fallbacks"] += 1
+            if _failures >= MAX_FAILURES:
+                _enabled = False
+                _warn_once("disabled", f"NPU failed {_failures} times (last: {e}); continuing on the CPU only")
+            else:
+                _warn_once("fail", f"NPU conv failed ({e}); this call ran on the CPU")
+        return _cpu_conv(x, w, st, pd)
+    bad = not _all_finite(out)
+    if bad or VERIFY == "always" or (VERIFY == "first" and status is None):
+        ok = not bad
+        if ok:   # check a few output channels of the first image against fp64
+            o_idx = torch.unique(torch.linspace(0, w.shape[0] - 1, min(4, w.shape[0])).round().long())
+            ref = torch.nn.functional.conv2d(x[:1].double(), w[o_idx].double(), stride=st, padding=pd)
+            den = ref.norm().item()
+            ok = den == 0.0 or (out[:1, o_idx].double() - ref).norm().item() / den <= VERIFY_TOL[precision]
+        if bad and not (_all_finite(x) and _all_finite(w)):
+            return out
+        _verified[key] = ok
+        if not ok:
+            _stats["rejected_shapes"] += 1
+            _stats["fallbacks"] += 1
+            _warn_once(("conv", key), f"NPU conv for {tuple(x.shape)} * {tuple(w.shape)} didn't match the CPU check; "
+                                      "using the CPU for it")
+            return _cpu_conv(x, w, st, pd)
+        _stats["verified_shapes"] += 1
+    return out
+
+
+@torch.library.custom_op("rknpu::conv2d", mutates_args=())
+def _rknpu_conv2d(x: torch.Tensor, w: torch.Tensor, stride: list[int], padding: list[int],
+                  precision: str) -> torch.Tensor:
+    return conv(x, w, stride, padding, precision)
+
+
+@_rknpu_conv2d.register_fake
+def _(x, w, stride, padding, precision):
+    oh = (x.shape[2] + 2 * padding[0] - w.shape[2]) // stride[0] + 1
+    ow = (x.shape[3] + 2 * padding[1] - w.shape[3]) // stride[1] + 1
+    return x.new_empty((x.shape[0], w.shape[0], oh, ow), dtype=torch.float32)
+
+
+def _conv_setup(ctx, inputs, output):
+    x, w, stride, padding, precision = inputs
+    ctx.save_for_backward(x, w)
+    ctx.stride, ctx.padding, ctx.precision = list(stride), list(padding), precision
+
+
+def _conv_backward(ctx, g):
+    x, w = ctx.saved_tensors
+    (sy, sx), (pt, pl) = ctx.stride, ctx.padding
+    O, C, kh, kw = w.shape
+    N, _, H, W = x.shape
+    gx = gw = None
+    g = g.contiguous()
+    if ctx.needs_input_grad[0]:
+        if pt <= kh - 1 and pl <= kw - 1:
+            # dX = conv(dY dilated by the stride, W rotated 180 deg with in/out swapped, pad k-1-p).
+            # When the stride doesn't divide the input evenly, the leftover rows/columns
+            # (output padding) are zero rows of dY at the bottom/right, not zeros of dX.
+            oph = H + 2 * pt - kh - (g.shape[2] - 1) * sy
+            opw = W + 2 * pl - kw - (g.shape[3] - 1) * sx
+            if sy > 1 or sx > 1 or oph or opw:
+                gd = g.new_zeros((N, O, (g.shape[2] - 1) * sy + 1 + oph, (g.shape[3] - 1) * sx + 1 + opw))
+                gd[:, :, :(g.shape[2] - 1) * sy + 1:sy, :(g.shape[3] - 1) * sx + 1:sx] = g
+            else:
+                gd = g
+            wr = w.flip(2, 3).transpose(0, 1).contiguous()
+            gx = torch.ops.rknpu.conv2d(gd, wr, [1, 1], [kh - 1 - pt, kw - 1 - pl], ctx.precision)
+        else:
+            gx = torch.nn.grad.conv2d_input(x.shape, w.float(), g, stride=(sy, sx), padding=(pt, pl))
+        gx = gx.to(x.dtype)
+    if ctx.needs_input_grad[1]:
+        # dW = dY (O x N*L) @ unfold(X)^T (N*L x C*kh*kw), one NPU GEMM
+        cols = torch.nn.functional.unfold(x.float(), (kh, kw), padding=(pt, pl), stride=(sy, sx))   # N, C*kh*kw, L
+        L = cols.shape[2]
+        gm = g.reshape(N, O, L).permute(1, 0, 2).reshape(O, N * L)
+        cm = cols.permute(0, 2, 1).reshape(N * L, C * kh * kw)
+        gw = torch.ops.rknpu.mm(gm, cm, ctx.precision).reshape(O, C, kh, kw).to(w.dtype)
+    return gx, gw, None, None, None
+
+
+_rknpu_conv2d.register_autograd(_conv_backward, setup_context=_conv_setup)
+
+
 def conv2d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
-    """conv2d lowered to im2col + NPU GEMM. Returns None if unsupported."""
-    if groups != 1 or isinstance(padding, str) or x.dim() != 4:
+    """F.conv2d with the convolution (forward and backward) on the NPU. Returns None if unsupported."""
+    if not conv_supported(x, weight, stride, padding, dilation, groups):
         return None
-    B, C, H, W = x.shape
-    O, _, kh, kw = weight.shape
-    st = (stride, stride) if isinstance(stride, int) else tuple(stride)
-    pd = (padding, padding) if isinstance(padding, int) else tuple(padding)
-    dl = (dilation, dilation) if isinstance(dilation, int) else tuple(dilation)
-    oh = (H + 2 * pd[0] - dl[0] * (kh - 1) - 1) // st[0] + 1
-    ow = (W + 2 * pd[1] - dl[1] * (kw - 1) - 1) // st[1] + 1
-    cols = torch.nn.functional.unfold(x, (kh, kw), dilation=dl, padding=pd, stride=st)  # B, C*kh*kw, L
-    cols = cols.transpose(1, 2).reshape(B * oh * ow, C * kh * kw)
-    y = linear(cols, weight.reshape(O, -1), bias)                                     # B*L, O
-    return y.reshape(B, oh * ow, O).transpose(1, 2).reshape(B, O, oh, ow)
+    y = torch.ops.rknpu.conv2d(x, weight, list(_pair(stride)), list(_pair(padding)), _precision)
+    y = y.to(_out_dtype(x, weight))
+    if bias is not None:
+        y = y + bias.view(1, -1, 1, 1)
+    return y
 
 
 def release():

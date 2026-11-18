@@ -15,7 +15,7 @@ CPU. Anything the NPU can't do, or does too slowly, falls back to the CPU automa
 __version__ = "0.3.0"
 
 from ._lib import NPU, PRECISIONS, default_npu, npu_available, npu_error
-from .mode import NPULinear, NPUMode, convert, disable, enable, npu_mode
+from .mode import NPUConv2d, NPULinear, NPUMode, convert, disable, enable, npu_mode
 from .ops import (bmm, conv2d, get_precision, gemm, is_enabled, linear, matmul, mm_raw, release,
                   reset_verification, scaled_dot_product_attention, set_enabled, set_precision, stats,
                   threshold)
@@ -23,7 +23,7 @@ from .tools import compare, profile
 from .calibrate import calibrate
 
 __all__ = ["NPU", "PRECISIONS", "default_npu", "npu_available", "npu_error",
-           "NPULinear", "NPUMode", "convert", "disable", "enable", "npu_mode",
+           "NPUConv2d", "NPULinear", "NPUMode", "convert", "disable", "enable", "npu_mode",
            "bmm", "conv2d", "get_precision", "gemm", "is_enabled", "linear", "matmul", "mm_raw", "release",
            "reset_verification", "scaled_dot_product_attention", "set_enabled", "set_precision", "stats",
            "threshold", "compare", "profile", "calibrate", "__version__"]

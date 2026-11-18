@@ -95,10 +95,18 @@ typedef struct {
 int rk_probe_raw(rk_ctx *ctx, const rk_probe_cfg *cfg, int M, int N, int K,
                  const void *a_rows, const void *w_bytes, void *c_rows);
 
+/* 2-D convolution on the NPU (fp32 NCHW in/out; prec RK_PREC_FP16 or RK_PREC_BF16).
+ * x: (N, C, H, W), w: (O, C, kh, kw), y: (N, O, oh, ow); padding top/left = pt/pl, bottom/right
+ * implied by oh/ow. Groups and dilation are not supported. */
+int rk_conv2d(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float *x,
+              int O, int kh, int kw, const float *w, int sy, int sx, int pt, int pl,
+              int oh, int ow, float *y, int accumulate);
+
 /* Raw single-task convolution (fp16 NHWC in, fp32 NHWC out) for probing. */
 typedef struct {
 	int h, w, c, n, kh, kw, sy, sx, pt, pl, oh, ow;
 	int grains, dbanks;     /* 0 = defaults */
+	int layout;             /* 0 = row-major (NHWC) attempt, 1 = NC1HWC2 */
 } rk_conv_cfg;
 int rk_conv_raw(rk_ctx *ctx, const rk_conv_cfg *cfg, const void *in_nhwc, const void *w_bytes, void *out_nhwc);
 

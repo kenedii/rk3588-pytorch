@@ -85,6 +85,8 @@ def _load():
     lib.rk_gemm_batched.restype = i
     lib.rk_release.argtypes = [vp]
     lib.rk_set_max_buf_mb.argtypes = [vp, i]
+    lib.rk_conv2d.argtypes = [vp, i, i, i, i, i, fp, i, i, i, fp, i, i, i, i, i, i, fp, i]
+    lib.rk_conv2d.restype = i
     lib.rk_buffer_bytes.argtypes = [vp]
     lib.rk_buffer_bytes.restype = ctypes.c_size_t
     lib.rk_query.argtypes = [vp, ctypes.POINTER(RkInfo)]
@@ -131,6 +133,15 @@ class NPU:
                                          b_ptr, sb_b, sb_k, sb_n, c_ptr, sc_b, ldc, 1 if accumulate else 0)
             if r != 0:
                 raise RuntimeError("rknpu gemm failed: " + self.lib.rk_last_error(self.ctx).decode())
+
+    def conv2d(self, N, C, H, W, x_ptr, O, kh, kw, w_ptr, sy, sx, pt, pl, oh, ow, y_ptr,
+               accumulate=False, precision="fp16"):
+        code = PRECISIONS["bf16" if precision == "bf16" else "fp16"]
+        with self.lock:
+            r = self.lib.rk_conv2d(self.ctx, code, N, C, H, W, x_ptr, O, kh, kw, w_ptr, sy, sx, pt, pl, oh, ow,
+                                   y_ptr, 1 if accumulate else 0)
+            if r != 0:
+                raise RuntimeError("rknpu conv2d failed: " + self.lib.rk_last_error(self.ctx).decode())
 
     # backwards compatible single-GEMM entry point
     def gemm_ptr(self, M, N, K, a_ptr, sa_m, sa_k, b_ptr, sb_k, sb_n, c_ptr, ldc, accumulate=False,

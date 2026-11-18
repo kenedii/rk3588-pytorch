@@ -286,6 +286,9 @@ typedef struct {
 	uint32_t in_dma, w_dma, out_dma, next_dma;
 	/* convolution geometry (all zero = matmul: width 1, height m, 1x1 kernel) */
 	int in_w, in_h, out_w, out_h, kw, kh, sx, sy, pl, pt;
+	int nc1hwc2;            /* 1: native NC1HWC2 feature/output layout (convolution) */
+	int surf_in_h;          /* NC1HWC2: full input height (surface stride), 0 = in_h */
+	int surf_out_hw;        /* NC1HWC2: full output plane (oh*ow) for surface strides, 0 = slice */
 } task_desc;
 
 /* Register stream for one row-major matmul task (precisions from t->dt). */
@@ -301,8 +304,16 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	const uint32_t pl = conv ? (uint32_t)t->pl : 0, pt = conv ? (uint32_t)t->pt : 0;
 	const uint32_t notch = n * (uint32_t)dt->out_bytes / 16 - 1;      /* 16-byte output atoms per row - 1 */
 	const uint32_t cbuf = (t->reuse ? CBUF_WEIGHT_REUSE : 0) | ((uint32_t)t->wbanks << 4) | (uint32_t)t->dbanks;
-	/* bit 29: row-major feature input */
-	const uint32_t conv1 = (1u << 29) | ((uint32_t)dt->proc_prec << 7) | ((uint32_t)dt->in_prec << 4);
+	/* bit 29 (GROUP_LINE_OFF) with width 1 makes the CNA read A as a plain row-major matrix;
+	 * convolutions use the native NC1HWC2 layout instead (16-byte channel atoms). */
+	const int nc = t->nc1hwc2;
+	const uint32_t conv1 = (nc ? 0u : (1u << 29)) | ((uint32_t)dt->proc_prec << 7) | ((uint32_t)dt->in_prec << 4);
+	const uint32_t line_stride = nc ? 4 * iw : iw * kb / 16;
+	const uint32_t sih = (nc && t->surf_in_h) ? (uint32_t)t->surf_in_h : ih;
+	const uint32_t surf_stride = nc ? (uint32_t)((double)line_stride * ((double)sih / 4.0 - 1.0)) : 0;
+	const uint32_t c_atoms = (kb + 15) / 16;                              /* 16-byte channel atoms per pixel */
+	const uint32_t entries = nc ? (iw * 2 * c_atoms + 7) / 8 : (iw * kb + 63) / 64;
+	const uint32_t dst_surf = nc ? (t->surf_out_hw ? (uint32_t)t->surf_out_hw : ow * oh) : 1;
 	int i = 0;
 #define R(blk, reg, val) (o[i++] = npuop((blk), (uint32_t)(val), (reg)))
 	R(OP_REG_CNA, CNA_CBUF_CON0, cbuf);
@@ -321,7 +332,7 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_CNA, CNA_WEIGHT_SIZE1, (kb * kw * kh) & 0x7FFFF);
 	R(OP_REG_CNA, CNA_WEIGHT_SIZE2, ((kw & 0x1F) << 24) | ((kh & 0x1F) << 16) | (n & 0x3FFF));
 	R(OP_REG_CNA, CNA_CBUF_CON0, cbuf);
-	R(OP_REG_CNA, CNA_CBUF_CON1, ((iw * kb + 63) / 64) & 0x1FFF);
+	R(OP_REG_CNA, CNA_CBUF_CON1, entries & 0x1FFF);
 	R(OP_REG_CNA, CNA_CVT_CON0, (1 << 3) | (1 << 1) | 1);
 	R(OP_REG_CNA, CNA_CVT_CON1, 1u << 16);
 	R(OP_REG_CNA, CNA_CVT_CON2, 1u << 16);
@@ -333,8 +344,8 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_CNA, CNA_FEATURE_DATA_ADDR, t->in_dma);
 	R(OP_REG_CNA, CNA_FC_CON2, 0);
 	R(OP_REG_CNA, CNA_DMA_CON0, (15u << 16) | 15u);
-	R(OP_REG_CNA, CNA_DMA_CON1, iw * kb / 16);   /* line stride: one row (iw pixels), 16-byte units */
-	R(OP_REG_CNA, CNA_DMA_CON2, 0);              /* surface stride: channel groups are contiguous */
+	R(OP_REG_CNA, CNA_DMA_CON1, line_stride);
+	R(OP_REG_CNA, CNA_DMA_CON2, surf_stride & 0xFFFFFFF);
 	R(OP_REG_CNA, CNA_FC_DATA_SIZE0, ((iw & 0x7FF) << 16) | (ih & 0x7FF));
 	R(OP_REG_CNA, CNA_FC_DATA_SIZE1, k & 0xFFFF);
 	R(OP_REG_CNA, CNA_DCOMP_CTRL, 0);
@@ -354,10 +365,10 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_DPU, DPU_DATA_FORMAT, ((uint32_t)dt->out_prec << 29) | ((uint32_t)dt->proc_prec << 26) | (uint32_t)dt->proc_prec);
 	R(OP_REG_DPU, DPU_OFFSET_PEND, 0);
 	R(OP_REG_DPU, DPU_DST_BASE_ADD, t->out_dma);
-	R(OP_REG_DPU, DPU_DST_SURF_STRIDE, 1u << 4);  /* row-major output: 4-float atoms are adjacent */
+	R(OP_REG_DPU, DPU_DST_SURF_STRIDE, (dst_surf & 0xFFFFFFF) << 4);  /* 1 = row-major output */
 	R(OP_REG_DPU, DPU_DATA_CUBE_WIDTH, (ow - 1) & 0x1FFF);
 	R(OP_REG_DPU, DPU_DATA_CUBE_HEIGHT, (oh - 1) & 0x1FFF);
-	R(OP_REG_DPU, DPU_DATA_CUBE_NOTCH_ADDR, (notch << 16) | notch);
+	R(OP_REG_DPU, DPU_DATA_CUBE_NOTCH_ADDR, nc ? 0 : ((notch << 16) | notch));
 	R(OP_REG_DPU, DPU_DATA_CUBE_CHANNEL, ((n - 1) << 16) | (n - 1));
 	R(OP_REG_DPU, DPU_BS_CFG, (1 << 6) | (1 << 4) | (1 << 1) | 1);
 	R(OP_REG_DPU, DPU_BS_ALU_CFG, 0);
@@ -379,7 +390,7 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_DPU, DPU_OUT_CVT_SCALE, dt->cvt_scale);
 	R(OP_REG_DPU, DPU_OUT_CVT_SHIFT, dt->cvt_shift);
 	for (int r = 0; r < 8; r++) R(OP_REG_DPU, DPU_EW_OP_VALUE_0 + 4 * r, 0);
-	R(OP_REG_DPU, DPU_SURFACE_ADD, dt->surf_add << 4);
+	R(OP_REG_DPU, DPU_SURFACE_ADD, ((dst_surf * dt->surf_add) & 0xFFFFFFF) << 4);
 	R(OP_REG_DPU, DPU_40C4, 0);
 	for (int r = 0; r < 12; r++) R(OP_REG_DPU, DPU_LUT_ACCESS_CFG + 4 * r, 0);
 	/* i == 108: PC tail, chaining to the next task's register stream if any */
@@ -1281,6 +1292,7 @@ int rk_probe_raw(rk_ctx *ctx, const rk_probe_cfg *cfg, int M, int N, int K,
  * ---------------------------------------------------------------------------------- */
 int rk_conv_raw(rk_ctx *ctx, const rk_conv_cfg *c, const void *in_nhwc, const void *w_bytes, void *out_nhwc) {
 	const dtype_t *dt = &DT_F16_F32;
+	/* c->c must be a multiple of 8 (fp16 atoms), c->n a multiple of 16 */
 	size_t in_b = (size_t)c->h * c->w * c->c * 2, w_b = (size_t)c->n * c->kh * c->kw * c->c * 2;
 	size_t out_b = (size_t)c->oh * c->ow * c->n * 4;
 	uint32_t dflags = MEM_FLAG_400 | RKNPU_MEM_CACHEABLE | RKNPU_MEM_NON_CONTIGUOUS;
@@ -1300,7 +1312,7 @@ int rk_conv_raw(rk_ctx *ctx, const rk_conv_cfg *c, const void *in_nhwc, const vo
 	                .dbanks = dbanks, .wbanks = wbanks, .reuse = 0, .in_dma = (uint32_t)ctx->a.dma,
 	                .w_dma = (uint32_t)ctx->b.dma, .out_dma = (uint32_t)ctx->c.dma, .next_dma = 0,
 	                .in_w = c->w, .in_h = c->h, .out_w = c->ow, .out_h = c->oh, .kw = c->kw, .kh = c->kh,
-	                .sx = c->sx, .sy = c->sy, .pl = c->pl, .pt = c->pt };
+	                .sx = c->sx, .sy = c->sy, .pl = c->pl, .pt = c->pt, .nc1hwc2 = c->layout };
 	emit_task(ctx->regcmd.ptr, &d);
 	struct rknpu_task td = { .enable_mask = 0xd, .int_mask = 0x300, .int_clear = 0x1ffff,
 	                         .regcfg_amount = REGCFG_AMOUNT, .regcmd_addr = ctx->regcmd.dma };
@@ -1313,5 +1325,222 @@ int rk_conv_raw(rk_ctx *ctx, const rk_conv_cfg *c, const void *in_nhwc, const vo
 	if (r < 0) return -1;
 	buf_sync(ctx, &ctx->c, out_b, RKNPU_MEM_SYNC_FROM_DEVICE);
 	memcpy(out_nhwc, ctx->c.ptr, out_b);
+	return 0;
+}
+
+/* ------------------------------------------------------------------------------------
+ * Native convolution: fp32 NCHW in/out, NC1HWC2 on the NPU
+ * ---------------------------------------------------------------------------------- */
+typedef struct {
+	const float *x, *w;
+	float *y;
+	int N, C, H, W, O, kh, kw, oh, ow;
+	int Cp, Cc, nk, Op;
+	f16 *xp, *wp;                  /* packed fp16 (or bf16 bits) */
+	float *yp;
+	int bf16;
+	float xs, ws, out_mul;
+	int accumulate;
+	size_t x_img, x_chunk, w_chunk, y_img, y_chunk;   /* elements */
+} conv_job;
+
+/* x: items (b, chunk j, c1 group of 8 channels) -> [C1][H][W][8] */
+static void conv_pack_x(void *v, int b, int e) {
+	conv_job *J = v;
+	const int HW = J->H * J->W, g = J->Cc / 8;
+	for (int it = b; it < e; it++) {
+		int c1 = it % g, j = (it / g) % J->nk, bb = it / (g * J->nk);
+		uint16_t *d = (uint16_t *)J->xp + (size_t)bb * J->x_img + (size_t)j * J->x_chunk + (size_t)c1 * HW * 8;
+		int c0 = j * J->Cc + c1 * 8;
+		const float *src[8];
+		for (int t = 0; t < 8; t++)
+			src[t] = (c0 + t < J->C) ? J->x + ((size_t)bb * J->C + c0 + t) * HW : NULL;
+		for (int p = 0; p < HW; p++)
+			for (int t = 0; t < 8; t++) {
+				float v0 = src[t] ? src[t][p] * J->xs : 0.f;
+				d[(size_t)p * 8 + t] = J->bf16 ? f32_to_bf16(v0) : ({ f16 h = (f16)v0; uint16_t u; memcpy(&u, &h, 2); u; });
+			}
+	}
+}
+
+/* w: items (chunk j, 16-kernel group) -> [Cc/32][kh][kw][16][32] */
+static void conv_pack_w(void *v, int b, int e) {
+	conv_job *J = v;
+	const int ng = J->Op / 16, khw = J->kh * J->kw;
+	for (int it = b; it < e; it++) {
+		int og = it % ng, j = it / ng;
+		uint16_t *d = (uint16_t *)J->wp + (size_t)j * J->w_chunk + (size_t)og * 16 * J->Cc * khw;
+		size_t n = 0;
+		for (int cb = 0; cb < J->Cc / 32; cb++)
+			for (int ky = 0; ky < J->kh; ky++)
+				for (int kx = 0; kx < J->kw; kx++)
+					for (int o2 = 0; o2 < 16; o2++)
+						for (int c2 = 0; c2 < 32; c2++) {
+							int o = og * 16 + o2, c = j * J->Cc + cb * 32 + c2;
+							float v0 = (o < J->O && c < J->C) ? J->w[(((size_t)o * J->C + c) * J->kh + ky) * J->kw + kx] * J->ws : 0.f;
+							d[n++] = J->bf16 ? f32_to_bf16(v0) : ({ f16 h = (f16)v0; uint16_t u; memcpy(&u, &h, 2); u; });
+						}
+	}
+}
+
+/* y: items (b, o) -> NCHW plane, summing channel chunks; source [Op/4][oh][ow][4] */
+static void conv_unpack_y(void *v, int b, int e) {
+	conv_job *J = v;
+	const int OHW = J->oh * J->ow;
+	for (int it = b; it < e; it++) {
+		int o = it % J->O, bb = it / J->O;
+		float *d = J->y + ((size_t)bb * J->O + o) * OHW;
+		for (int p = 0; p < OHW; p++) {
+			float acc = 0.f;
+			for (int j = 0; j < J->nk; j++)
+				acc += J->yp[(size_t)bb * J->y_img + (size_t)j * J->y_chunk + ((size_t)(o / 4) * OHW + p) * 4 + (o & 3)];
+			acc *= J->out_mul;
+			if (J->accumulate) d[p] += acc; else d[p] = acc;
+		}
+	}
+}
+
+int rk_conv2d(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float *x,
+              int O, int kh, int kw, const float *w, int sy, int sx, int pt, int pl,
+              int oh, int ow, float *y, int accumulate) {
+	double t_start = now_us();
+	memset(&ctx->stats, 0, sizeof(ctx->stats));
+	if (N <= 0 || C <= 0 || H <= 0 || W <= 0 || O <= 0 || kh <= 0 || kw <= 0 || oh <= 0 || ow <= 0 ||
+	    kh > 31 || kw > 31 || sy < 1 || sx < 1 || sy > 7 || sx > 7 || pt < 0 || pl < 0 || pt > 15 || pl > 15 ||
+	    W > 2047 || H > 2047) {
+		set_err(ctx, "unsupported convolution geometry");
+		return -1;
+	}
+	const dtype_t *dt = prec == RK_PREC_BF16 ? &DT_BF16_F32 : &DT_F16_F32;
+	conv_job J = { .x = x, .w = w, .y = y, .N = N, .C = C, .H = H, .W = W, .O = O, .kh = kh, .kw = kw,
+	               .oh = oh, .ow = ow, .bf16 = prec == RK_PREC_BF16, .xs = 1.f, .ws = 1.f, .out_mul = 1.f,
+	               .accumulate = accumulate };
+	const int khw = kh * kw;
+	/* channel chunks: a 16-kernel weight group must fit in <= 8 banks, and one input row in the rest */
+	int Cp = round_up(C, 32), Cc = Cp;
+	while (Cc > 32 && (16L * khw * Cc * 2 > 8L * CBUF_BANK_SIZE)) Cc = round_up(Cc / 2, 32);
+	int nk = ceil_div(Cp, Cc);
+	Cc = round_up(ceil_div(Cp, nk), 32);
+	Cp = Cc * nk;
+	int Op = round_up(O, 16);
+	if (Op > 4096) { set_err(ctx, "too many output channels (%d) for one convolution", O); return -1; }
+	J.Cp = Cp; J.Cc = Cc; J.nk = nk; J.Op = Op;
+	/* CBUF split */
+	long wgroup = 16L * khw * Cc * 2, wall = (long)Op * khw * Cc * 2;
+	int wbanks = (int)ceil_div((int)(wall < 4L * CBUF_BANK_SIZE ? wall : (wgroup > 4L * CBUF_BANK_SIZE ? wgroup : 4L * CBUF_BANK_SIZE)), CBUF_BANK_SIZE);
+	if (wbanks < 1) wbanks = 1;
+	int dbanks_max = CBUF_BANKS - wbanks;
+	long entries_row = (W * 2L * (Cc / 8) + 7) / 8;                  /* CBUF entries (128 B) per input row */
+	long rows_fit = (dbanks_max * 256L) / entries_row;                /* input rows that fit */
+	if (rows_fit < kh + 2) { set_err(ctx, "image row too wide for CBUF (W=%d, C=%d)", W, C); return -1; }
+	/* output rows per slice: (rows-1)*sy + kh input rows (+1 preload) must fit */
+	int orows = (int)((rows_fit - 1 - kh) / sy) + 1;
+	if (orows > oh) orows = oh;
+	int nslice = ceil_div(oh, orows);
+	orows = ceil_div(oh, nslice);
+	int max_in_rows = (orows - 1) * sy + kh;
+	if (max_in_rows > H) max_in_rows = H;
+	int dbanks_all = ceil_div((int)(entries_row * (max_in_rows + 1)), 256);
+	if (dbanks_all > dbanks_max) dbanks_all = dbanks_max;
+	wbanks = CBUF_BANKS - dbanks_all;
+	int weights_fit = wall <= (long)wbanks * CBUF_BANK_SIZE;
+	int T = N * nk * nslice;
+	ctx->stats.tasks = T;
+
+	J.x_chunk = (size_t)Cc * H * W; J.x_img = J.x_chunk * nk;
+	J.w_chunk = (size_t)Op * khw * Cc;
+	J.y_chunk = (size_t)Op * oh * ow; J.y_img = J.y_chunk * nk;
+	size_t xb = J.x_img * N * 2, wb = J.w_chunk * nk * 2, yb = J.y_img * N * 4;
+	uint32_t dflags = MEM_FLAG_400 | RKNPU_MEM_CACHEABLE | RKNPU_MEM_NON_CONTIGUOUS;
+	if (xb + wb + yb > ctx->max_buf * 2 && N > 1) {
+		/* split the batch to bound NPU memory */
+		int n1 = N / 2;
+		int r = rk_conv2d(ctx, prec, n1, C, H, W, x, O, kh, kw, w, sy, sx, pt, pl, oh, ow, y, accumulate);
+		if (r) return r;
+		return rk_conv2d(ctx, prec, N - n1, C, H, W, x + (size_t)n1 * C * H * W, O, kh, kw, w, sy, sx, pt, pl, oh, ow,
+		                 y + (size_t)n1 * O * oh * ow, accumulate);
+	}
+	if (buf_ensure(ctx, &ctx->a, xb, dflags) || buf_ensure(ctx, &ctx->b, wb, dflags) ||
+	    buf_ensure(ctx, &ctx->c, yb, dflags) ||
+	    buf_ensure(ctx, &ctx->regcmd, (size_t)T * REGCMD_SLOTS * 8, dflags) ||
+	    buf_ensure(ctx, &ctx->tasks, (size_t)T * sizeof(struct rknpu_task), dflags | RKNPU_MEM_KERNEL_MAPPING))
+		return -1;
+	J.xp = ctx->a.ptr; J.wp = ctx->b.ptr; J.yp = ctx->c.ptr;
+
+	double t0 = now_us();
+	if (!J.bf16 && ctx->autoscale) {
+		float mx = 0.f, mw = 0.f;
+		size_t nx = (size_t)N * C * H * W, nw = (size_t)O * C * khw;
+		for (size_t i = 0; i < nx; i++) { float a = fabsf(x[i]); mx = a > mx ? a : mx; }
+		for (size_t i = 0; i < nw; i++) { float a = fabsf(w[i]); mw = a > mw ? a : mw; }
+		J.xs = pow2_scale(mx); J.ws = pow2_scale(mw);
+		J.out_mul = 1.f / (J.xs * J.ws);
+	}
+	parallel_for(ctx, N * nk * (Cc / 8), 1, conv_pack_x, &J);
+	parallel_for(ctx, nk * (Op / 16), 1, conv_pack_w, &J);
+	ctx->stats.pack_us = now_us() - t0;
+	buf_sync(ctx, &ctx->a, xb, RKNPU_MEM_SYNC_TO_DEVICE);
+	buf_sync(ctx, &ctx->b, wb, RKNPU_MEM_SYNC_TO_DEVICE);
+
+	uint64_t *rc = ctx->regcmd.ptr;
+	struct rknpu_task *tk = ctx->tasks.ptr;
+	int cores = ctx->mode == 2 ? 3 : 1;
+	int per_submit = ctx->mode == 0 ? 1 : PC_TASK_LIMIT;
+	for (int t = 0; t < T; t++) {
+		int sl = t % nslice, j = (t / nslice) % nk, bb = t / (nslice * nk);
+		int r0 = sl * orows, r1 = r0 + orows < oh ? r0 + orows : oh;
+		int in0 = r0 * sy - pt, in1 = (r1 - 1) * sy - pt + kh;
+		int ptop = in0 < 0 ? -in0 : 0;
+		if (in0 < 0) in0 = 0;
+		if (in1 > H) in1 = H;
+		int sub_start = (t / per_submit) * per_submit;
+		int sub_count = T - sub_start < per_submit ? T - sub_start : per_submit;
+		int first = 0, last = 0;
+		if (ctx->mode == 0) first = last = 1;
+		else if (cores == 1 || sub_count < 3) { first = t == sub_start; last = t == sub_start + sub_count - 1; }
+		else {
+			int base = sub_start;
+			for (int cc = 0; cc < 3; cc++) {
+				int n = sub_count / 3 + (cc < sub_count % 3);
+				if (t == base) first = 1;
+				if (t == base + n - 1) last = 1;
+				base += n;
+			}
+		}
+		int in_rows = in1 - in0;
+		/* the same CBUF split for every task: the weight-reuse bit assumes weights stay in
+		 * the same banks, which breaks if an edge slice (fewer rows) moved the boundary */
+		int dbanks = dbanks_all;
+		task_desc d = {
+			.dt = dt, .m = in_rows, .k = Cc, .n = Op, .grains = in_rows + 1,
+			.dbanks = dbanks, .wbanks = CBUF_BANKS - dbanks,
+			.reuse = ctx->reuse && weights_fit && !first && (sl > 0 || bb > 0) && nk == 1,
+			.in_dma = (uint32_t)(ctx->a.dma + ((size_t)bb * J.x_img + (size_t)j * J.x_chunk + (size_t)in0 * W * 8) * 2),
+			.w_dma = (uint32_t)(ctx->b.dma + (size_t)j * J.w_chunk * 2),
+			.out_dma = (uint32_t)(ctx->c.dma + ((size_t)bb * J.y_img + (size_t)j * J.y_chunk + (size_t)r0 * ow * 4) * 4),
+			.next_dma = last ? 0 : (uint32_t)(ctx->regcmd.dma + (size_t)(t + 1) * REGCMD_SLOTS * 8),
+			.in_w = W, .in_h = in_rows, .out_w = ow, .out_h = r1 - r0, .kw = kw, .kh = kh, .sx = sx, .sy = sy,
+			.pl = pl, .pt = ptop, .nc1hwc2 = 1, .surf_in_h = H, .surf_out_hw = oh * ow,
+		};
+		emit_task(rc + (size_t)t * REGCMD_SLOTS, &d);
+		struct rknpu_task td = {
+			.enable_mask = 0xd, .int_mask = 0x300, .int_clear = 0x1ffff,
+			.regcfg_amount = REGCFG_AMOUNT, .regcmd_addr = ctx->regcmd.dma + (size_t)t * REGCMD_SLOTS * 8,
+		};
+		tk[t] = td;
+	}
+	buf_sync(ctx, &ctx->regcmd, (size_t)T * REGCMD_SLOTS * 8, RKNPU_MEM_SYNC_TO_DEVICE);
+	buf_sync(ctx, &ctx->tasks, (size_t)T * sizeof(struct rknpu_task), RKNPU_MEM_SYNC_TO_DEVICE);
+	npu_lock(ctx);
+	for (int s0 = 0; s0 < T; s0 += per_submit) {
+		int cnt = T - s0 < per_submit ? T - s0 : per_submit;
+		if (submit(ctx, s0, cnt, (cores == 3 && cnt >= 3) ? 3 : 1) < 0) { npu_unlock(ctx); return -1; }
+	}
+	npu_unlock(ctx);
+	buf_sync(ctx, &ctx->c, yb, RKNPU_MEM_SYNC_FROM_DEVICE);
+	t0 = now_us();
+	parallel_for(ctx, N * O, 4, conv_unpack_y, &J);
+	ctx->stats.unpack_us = now_us() - t0;
+	ctx->stats.total_us = now_us() - t_start;
 	return 0;
 }

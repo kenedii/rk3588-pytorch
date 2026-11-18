@@ -4,10 +4,11 @@
         loss = model(x).sum()
         loss.backward()
 
-Inside the context, F.linear, matmul / mm / bmm / addmm / baddbmm and
-F.scaled_dot_product_attention on CPU float tensors run their GEMMs (forward and
-backward) on the NPU; every other op stays on the CPU. conv2d can be routed too with
-npu_mode(conv=True). If no NPU is available everything simply runs on the CPU.
+Inside the context, F.linear, matmul / mm / bmm / addmm / baddbmm,
+F.scaled_dot_product_attention and F.conv2d on CPU float tensors run on the NPU (forward
+and backward); every other op stays on the CPU. Convolutions use the NPU's native
+convolution engine (groups=1, dilation=1; others fall back to the CPU). If no NPU is
+available everything simply runs on the CPU.
 """
 import torch
 import torch.nn.functional as F
@@ -33,7 +34,7 @@ def _big_enough(macs):
 class NPUMode(TorchFunctionMode):
     """See module docstring. Options: linear, matmul, attention, conv (bool), precision (str)."""
 
-    def __init__(self, linear=True, matmul=True, attention=True, conv=False, precision=None, calibrate=True):
+    def __init__(self, linear=True, matmul=True, attention=True, conv=True, precision=None, calibrate=True):
         super().__init__()
         self.precision = precision
         self._prev_precision = None
@@ -158,13 +159,28 @@ class NPULinear(torch.nn.Linear):
         return F.linear(x, self.weight, self.bias)
 
 
+class NPUConv2d(torch.nn.Conv2d):
+    """nn.Conv2d whose convolution runs on the NPU (works without npu_mode, and with torch.compile)."""
+
+    def forward(self, x):
+        if (self.padding_mode == "zeros" and isinstance(self.padding, tuple) and ops._enabled
+                and ops._usable(x, self.weight)
+                and ops.conv_supported(x, self.weight, self.stride, self.padding, self.dilation, self.groups)):
+            y = ops.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+            if y is not None:
+                return y
+        return super().forward(x)
+
+
+_SWAP = {torch.nn.Linear: NPULinear, torch.nn.Conv2d: NPUConv2d}
+
+
 def convert(model):
-    """Swap every nn.Linear in `model` for NPULinear, in place (weights are shared). Returns model."""
-    for name, child in list(model.named_children()):
-        if type(child) is torch.nn.Linear:
-            child.__class__ = NPULinear
-        else:
-            convert(child)
-    if type(model) is torch.nn.Linear:
-        model.__class__ = NPULinear
+    """Swap every nn.Linear / nn.Conv2d in `model` for its NPU version, in place (weights are
+    shared, state_dict keys unchanged). Returns model."""
+    if type(model) in _SWAP:
+        model.__class__ = _SWAP[type(model)]
+        return model
+    for _, child in list(model.named_children()):
+        convert(child)
     return model

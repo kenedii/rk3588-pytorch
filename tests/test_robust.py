@@ -158,7 +158,7 @@ buf = io.StringIO()
 with rt.profile(file=buf):
     with rt.npu_mode():
         npu_model(xin).sum().backward()
-check("profile() reports NPU GEMMs", "NPU GEMMs" in buf.getvalue() and "rknpu::gemm" in buf.getvalue())
+check("profile() reports NPU ops", "NPU ops" in buf.getvalue() and "rknpu::gemm" in buf.getvalue())
 
 print("stats:", ops.stats())
 print("ALL PASS" if failures == 0 else f"{failures} FAILURES")

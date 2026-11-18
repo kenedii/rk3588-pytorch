@@ -12,8 +12,45 @@ import torch.nn.functional as F
 from . import ops
 from .mode import npu_mode
 
-# gradient error (relative, vs CPU fp32) above which a precision is not recommended
-GRAD_TOL = {"fp16": 2e-2, "fp16_out16": 2e-2, "bf16": 5e-2, "int8": 1.5e-1, "fp16x3": 1e-3}
+# Gradient error (relative to CPU fp32) always accepted for a precision. On top of this, a
+# precision is accepted if its NPU error is at most BASELINE_FACTOR x the error of the
+# same model run on the CPU in that precision: in ReLU/MaxPool networks a handful of
+# rounding-induced flips can inflate the first-step gradient error without hurting
+# training, and the CPU low-precision run measures exactly that inherent effect.
+GRAD_TOL = {"fp16": 5e-3, "fp16_out16": 5e-3, "bf16": 2e-2, "int8": 1.5e-1, "fp16x3": 1e-3}
+BASELINE_FACTOR = 2.0
+_EMULATE = {"fp16": torch.float16, "fp16_out16": torch.float16, "bf16": torch.bfloat16}
+
+
+def _lowprec_baseline(model, inputs, loss_fn, precision, ref_grads, seed):
+    """Relative gradient error of an fp32 CPU step that rounds exactly where the NPU does:
+    every Linear/Conv2d input, weight and incoming gradient is rounded to `precision`
+    (fp16 or bf16) and the products accumulate in fp32. Fast (it runs at fp32 speed) and
+    measures the error inherent to the precision, independent of the NPU."""
+    dt = _EMULATE.get(precision)
+    if dt is None or ref_grads is None:
+        return None
+    try:
+        m = copy.deepcopy(model)
+        m.train()
+        rnd = lambda t: t.to(dt).to(t.dtype) if torch.is_tensor(t) and t.is_floating_point() else t  # noqa: E731
+        hooks = []
+        for mod in m.modules():
+            if isinstance(mod, (torch.nn.Linear, torch.nn.Conv2d)):
+                with torch.no_grad():
+                    mod.weight.copy_(rnd(mod.weight))
+                hooks.append(mod.register_forward_pre_hook(lambda _m, args: tuple(rnd(a) for a in args)))
+                hooks.append(mod.register_full_backward_pre_hook(lambda _m, go: tuple(rnd(g) for g in go)))
+        torch.manual_seed(seed)
+        loss = loss_fn(m(*inputs))
+        loss.backward()
+        for h in hooks:
+            h.remove()
+        g = _flat_grads(m)
+        den = ref_grads.norm().item()
+        return (g - ref_grads).norm().item() / den if den > 0 else 0.0
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _flat_grads(model):
@@ -35,7 +72,7 @@ def _default_loss(target):
 
 
 def compare(model, inputs, target=None, loss_fn=None, precisions=("fp16", "bf16", "int8", "fp16x3"),
-            steps=6, warmup=2, lr=1e-3, conv=False, seed=0, verbose=True, file=None):
+            steps=6, warmup=2, lr=1e-3, conv=True, seed=0, verbose=True, file=None):
     """Train `steps` steps on the CPU and with the NPU in each precision, from identical copies
     of `model`, and report step time, speedup, gradient error and loss drift.
 
@@ -89,6 +126,8 @@ def compare(model, inputs, target=None, loss_fn=None, precisions=("fp16", "bf16"
             den = ref_grads.norm().item()
             r["grad_err"] = (grads - ref_grads).norm().item() / den if den > 0 else 0.0
             r["loss_diff"] = sum(abs(a - b) for a, b in zip(losses, ref_losses)) / len(losses)
+            r["rel_loss_diff"] = r["loss_diff"] / max(sum(abs(v) for v in ref_losses) / len(ref_losses), 1e-12)
+            r["baseline_err"] = _lowprec_baseline(model, inputs, loss_fn, mode, ref_grads, seed)
         results[mode] = r
 
     cpu_ms = results["cpu"]["step_ms"]
@@ -98,23 +137,34 @@ def compare(model, inputs, target=None, loss_fn=None, precisions=("fp16", "bf16"
         if "error" in r:
             continue
         r["speedup"] = cpu_ms / r["step_ms"]
-        if r["grad_err"] <= GRAD_TOL.get(mode, 5e-2) and r["speedup"] >= 1.1:
+        tol = GRAD_TOL.get(mode, 5e-2)
+        if r.get("baseline_err") is not None:
+            tol = max(tol, BASELINE_FACTOR * r["baseline_err"])
+        r["accurate"] = r["grad_err"] <= tol and r["rel_loss_diff"] <= 0.05
+        if r["accurate"] and r["speedup"] >= 1.1:
             if best is None or r["step_ms"] < results[best]["step_ms"]:
                 best = mode
     rec = best or "cpu"
     if verbose:
-        print(f"\n{'mode':<12}{'step ms':>10}{'speedup':>9}{'grad err':>11}{'loss diff':>11}{'on NPU':>8}{'fallbk':>8}",
-              file=file)
+        print(f"\n{'mode':<12}{'step ms':>10}{'speedup':>9}{'grad err':>11}{'cpu same prec':>14}{'loss diff':>11}"
+              f"{'on NPU':>8}{'fallbk':>8}  ok", file=file)
         for mode in modes:
             r = results[mode]
             if "error" in r:
                 print(f"{mode:<12}  error: {r['error']}", file=file)
                 continue
             if mode == "cpu":
-                print(f"{mode:<12}{r['step_ms']:>10.1f}{1.0:>8.2f}x{'-':>11}{'-':>11}{'-':>8}{'-':>8}", file=file)
+                print(f"{mode:<12}{r['step_ms']:>10.1f}{1.0:>8.2f}x{'-':>11}{'-':>14}{'-':>11}{'-':>8}{'-':>8}",
+                      file=file)
             else:
+                base = r.get("baseline_err")
                 print(f"{mode:<12}{r['step_ms']:>10.1f}{r['speedup']:>8.2f}x{r['grad_err']:>11.1e}"
-                      f"{r['loss_diff']:>11.2e}{r['npu_share'] * 100:>7.0f}%{r['fallbacks']:>8}", file=file)
+                      f"{('%.1e' % base) if base is not None else '-':>14}{r['loss_diff']:>11.2e}"
+                      f"{r['npu_share'] * 100:>7.0f}%{r['fallbacks']:>8}  {'yes' if r.get('accurate') else 'NO'}",
+                      file=file)
+        print("  grad err: first-step gradient vs CPU fp32.  cpu same prec: the same step on the CPU with "
+              "inputs, weights and gradients rounded to that precision (the error the precision itself causes)",
+              file=file)
         if rec == "cpu":
             print("\nrecommendation: stay on the CPU (no precision was both accurate and >=1.1x faster "
                   "for this model and batch size; larger layers or batches help)", file=file)
@@ -141,9 +191,9 @@ def profile(top=12, file=None):
     wall = time.perf_counter() - t0
     st = ops.stats()
     print(f"\nrk3588_torch profile: {wall * 1e3:.1f} ms wall", file=file)
-    print(f"  NPU GEMMs : {st['npu_calls']:6d} calls  {st['npu_time'] * 1e3:9.1f} ms  "
+    print(f"  NPU ops   : {st['npu_calls']:6d} calls  {st['npu_time'] * 1e3:9.1f} ms  "
           f"({st['npu_time'] / wall * 100:4.1f}% of wall)  {st['npu_macs'] / 1e9:.2f} GMAC", file=file)
-    print(f"  CPU GEMMs : {st['cpu_calls']:6d} calls  {st['cpu_time'] * 1e3:9.1f} ms  "
+    print(f"  CPU ops   : {st['cpu_calls']:6d} calls  {st['cpu_time'] * 1e3:9.1f} ms  "
           f"({st['cpu_time'] / wall * 100:4.1f}% of wall)  {st['cpu_macs'] / 1e9:.2f} GMAC "
           "(below the NPU threshold, outside npu_mode, or fallbacks)", file=file)
     if st["fallbacks"] or st["rejected_shapes"]:
