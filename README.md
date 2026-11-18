@@ -36,14 +36,14 @@ optimizer.step()                       # everything else stays on the CPU
 | | |
 |---|---|
 | ⚡ **731 GFLOPS** | 2048³ matmul end to end, **9.1×** the CPU. The NPU alone hits ~1.2 TFLOPS |
-| 🏋️ **Up to 3.5× faster training** | MLP 3.5×, ResNet 2.2×, Transformer 1.6× per training step, same accuracy |
+| 🏋️ **Up to 3.5× faster training** | MLP 3.5×, ResNet 2.2×, Transformer 1.6× per training step, same accuracy; LoRA on frozen layers 3.9× |
 | 🎯 **Matches CPU training** | fp32 accumulation; same accuracy, mean loss difference 0.0006 on the wide MLP |
 | 🔌 **Drop-in** | no model conversion, no RKNN runtime, no changes to your model code |
 | 🎚️ **Five precisions** | fp16, bf16, int8, fp16-output, and an fp32-accurate split mode (~1e-7 error) |
 | 🧠 **All three NPU cores** | work is split across cores automatically |
 | 🧱 **Linear, conv, attention** | `Linear`, native NPU `Conv1d`/`Conv2d`/`ConvTranspose2d` (incl. grouped), `einsum`, attention, `bmm`, `torch.compile` |
 | 🔗 **Fused bias + ReLU** | added while the NPU output is unpacked; a ReLU with no bias runs in the NPU's own DPU stage |
-| 🧊 **Weight cache** | frozen or unchanged weights (LoRA, eval, inference) are converted for the NPU once, not every call |
+| 🧊 **Weight cache** | frozen or unchanged weights (LoRA, eval, inference) are converted for the NPU once: 5.5× faster MLP inference |
 | 🛟 **Can't make things worse** | NPU errors, wrong results and NaNs fall back to the CPU automatically; small ops stay on the CPU |
 | 🩺 **Tells you if it's worth it** | `doctor` checks your setup, `compare()` measures your model and recommends a precision |
 | 🔬 **Built from scratch** | writes the NPU's register command streams directly; reverse-engineering tools included |
@@ -150,6 +150,32 @@ The bigger the layers and batches, the bigger the win. What's left on the CPU (n
 activations, pooling, softmax, embeddings, the optimizer) caps the speedup; `profile()`
 shows that split for your own model.
 
+**Newer ops, the weight cache and fusion** (`bench/bench_new_ops.py`, fp16, median of
+5-7 runs; "train step" is forward + backward + SGD):
+
+| Workload | CPU fp32 | NPU | Speedup |
+|---|---:|---:|---:|
+| MLP inference, batch 32, 42M params, no weight cache | 70.3 ms | 27.5 ms | 2.6× |
+| MLP inference, batch 32, 42M params, **weight cache** | 70.3 ms | **12.8 ms** | **5.5×** |
+| LoRA r=16 on a frozen 42M MLP, batch 128, no weight cache | 260 ms | 148 ms | 1.8× |
+| LoRA r=16 on a frozen 42M MLP, batch 128, **weight cache** | 260 ms | **66 ms** | **3.9×** |
+| `einsum('bnd,de->bne')`, 32×512×1024 @ 1024×1024 | 444 ms | 68 ms | 6.6× |
+| `einsum('bhqd,bhkd->bhqk')`, 16×8 heads, 256×256×64 | 58 ms | 21 ms | 2.8× |
+| Grouped conv 3×3, 256→256, groups=4, 28×28 (train step) | 362 ms | 80 ms | 4.5× |
+| Grouped conv 3×3, 256→256, groups=8, 28×28 (train step) | 87 ms | 70 ms | 1.2× |
+| Conv1d stack, 3 × 256 channels, k=5, length 2000 (train step) | 1455 ms | 663 ms | 2.2× |
+| UNet up-block: ConvTranspose 2×2 s2 256→128 + two 3×3 convs (train step) | 857 ms | 546 ms | 1.6× |
+| MobileNetV2 block, depthwise on the CPU (train step) | 704 ms | 497 ms | 1.4× |
+| ConvTranspose2d 4×4 s2 p1, 128→64, 32×32 (train step) | 174 ms | 188 ms | 0.9× |
+| Linear 256×2048×2048 + bias + ReLU, unfused / fused | 55.6 ms | 6.5 / 6.3 ms | 8.6× / 8.8× |
+
+The weight cache is what makes inference and LoRA fast: converting fp32 weights for the NPU
+is a big part of each call, and frozen weights now only pay for it once. Fusing bias and ReLU
+saves an extra pass over the output; it's small next to the matmul itself. Transposed
+convolutions with overlapping kernels (4×4, stride 2) spend their time in the CPU-side
+scatter-add, so they only break even; the common 2×2 stride-2 upsampling layer is a single
+GEMM.
+
 <details>
 <summary>Full GEMM table (1 core vs 3 cores) and timing breakdown</summary>
 
@@ -232,7 +258,7 @@ PyTorch op (linear, matmul/mm/bmm/addmm/baddbmm, einsum, conv1d/conv2d/conv_tran
    │  rk3588_torch.npu_mode() is a TorchFunctionMode that intercepts these ops
    │  (or convert(model) swaps in NPU modules and fuses Linear/Conv -> ReLU)
    │  einsum -> permute + one batched GEMM; conv1d -> conv2d of width 1;
-   │  conv_transpose2d -> one GEMM (kernel == stride) or a conv of the zero-dilated input
+   │  conv_transpose2d -> one GEMM for every kernel tap, then a CPU scatter-add (col2im)
    ▼
 torch.library custom ops rknpu::mm / rknpu::linear / rknpu::conv2d, with autograd formulas:
    │  forward GEMM + dX = dY·W + dW = dYᵀ·X; conv dX as a convolution, dW as a GEMM
@@ -291,6 +317,11 @@ Things that had to be discovered to make this work on a current kernel/driver:
   register constants (precision codes, output converter, surface add, notch). Probing
   the unused precision code 3 with a layout-independent test (B = all ones, so every
   output is a row sum) revealed a working bf16 MAC path.
+* **Streamed weights need 512-multiple K chunks.** When the weights don't fit beside the
+  data banks, the CNA streams them; for K chunks such as 2016, 3008 or 4000 (with N = 64)
+  that hung the NPU, while multiples of 512 always worked. The library pads the chunk with
+  zeros in that case. The FEATURE_GRAINS field (input rows + 1 per task) is 10 bits, so
+  long feature maps (e.g. conv1d sequences) are split into row slices of at most 1022 rows.
 * **ReLU in the DPU, and what didn't work.** Clearing the bypass bits of the DPU's BS
   stage (`DPU_BS_CFG` = 0x12) applies a ReLU to the accumulator before it is written out;
   it's used when no bias has to be added first. The hardware depthwise mode

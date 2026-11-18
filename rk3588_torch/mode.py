@@ -218,7 +218,7 @@ class NPUConv1d(torch.nn.Conv1d):
 
 
 class NPUConvTranspose2d(torch.nn.ConvTranspose2d):
-    """nn.ConvTranspose2d on the NPU (a GEMM when kernel == stride, else a convolution)."""
+    """nn.ConvTranspose2d on the NPU (one GEMM, plus a CPU scatter-add when kernel taps overlap)."""
 
     def forward(self, x, output_size=None):
         if self.padding_mode == "zeros" and ops._enabled and ops._usable(x, self.weight):
