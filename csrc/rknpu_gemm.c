@@ -58,6 +58,20 @@ typedef struct {
 	uint32_t flags;
 } rk_buf;
 
+/* One cached, already packed weight operand (GEMM B or convolution weights) */
+struct wc_entry {
+	uint64_t key;
+	int      kind;              /* 1 = GEMM B, 2 = convolution weights */
+	int      prec;
+	int      d[6];              /* shape: GEMM (K, N); conv (O, Cg, kh, kw, groups) */
+	int      layout[4];         /* GEMM tiling (Kc, Nc, nk, nn) the bytes were packed for */
+	int      packed;
+	rk_buf   buf;
+	float    scale;             /* fp16 auto-scale of the operand */
+	float   *col;               /* int8: per-column scales [N] then their inverses [N] */
+	uint64_t last_use;
+};
+
 struct rk_ctx {
 	int      fd;
 	int      mode;
@@ -74,6 +88,15 @@ struct rk_ctx {
 	float   *scr[3];
 	size_t   scr_n[3];
 	rk_buf   regcmd, tasks, a, b, c;
+	/* output epilogue for the next calls (see rk_set_epilogue) */
+	const float *epi_bias;
+	int      epi_relu;
+	/* packed-weight cache (see rk_set_wcache_key) */
+	uint64_t wc_key;
+	struct wc_entry *wc;
+	int      wc_n, wc_cap;
+	size_t   wc_bytes, wc_max;
+	uint64_t wc_clock;
 	rk_stats stats;
 	char     err[256];
 };
@@ -134,6 +157,7 @@ rk_ctx *rk_open(const char *dev) {
 	ctx->reuse = env_int("RKNPU_WEIGHT_REUSE", 1);
 	ctx->autoscale = env_int("RKNPU_AUTOSCALE", 1);
 	ctx->max_buf = (size_t)env_int("RKNPU_MAX_BUF_MB", 512) << 20;
+	ctx->wc_max = (size_t)env_int("RKNPU_WCACHE_MB", 256) << 20;
 	ctx->lock_fd = -1;
 	if (env_int("RKNPU_LOCK", 1)) {
 		const char *lp = getenv("RKNPU_LOCK_FILE") ? getenv("RKNPU_LOCK_FILE") : "/tmp/rk3588_torch.lock";
@@ -152,8 +176,89 @@ static void buf_free(rk_ctx *ctx, rk_buf *b) {
 	memset(b, 0, sizeof(*b));
 }
 
+static void wc_free_entry(rk_ctx *ctx, struct wc_entry *e) {
+	buf_free(ctx, &e->buf);
+	free(e->col);
+	ctx->wc_bytes -= e->buf.size;
+	memset(e, 0, sizeof(*e));
+}
+
+void rk_wcache_clear(rk_ctx *ctx) {
+	for (int i = 0; i < ctx->wc_n; i++) wc_free_entry(ctx, &ctx->wc[i]);
+	ctx->wc_n = 0;
+	ctx->wc_bytes = 0;
+}
+
+void rk_wcache_drop(rk_ctx *ctx, uint64_t key) {
+	for (int i = 0; i < ctx->wc_n; i++)
+		if (ctx->wc[i].key == key) {
+			wc_free_entry(ctx, &ctx->wc[i]);
+			ctx->wc[i] = ctx->wc[--ctx->wc_n];
+			i--;
+		}
+}
+
+size_t rk_wcache_bytes(rk_ctx *ctx) { return ctx->wc_bytes; }
+int    rk_wcache_entries(rk_ctx *ctx) { return ctx->wc_n; }
+void   rk_set_wcache_mb(rk_ctx *ctx, int mb) { ctx->wc_max = (size_t)(mb > 0 ? mb : 0) << 20; }
+void   rk_set_wcache_key(rk_ctx *ctx, uint64_t key) { ctx->wc_key = key; }
+void   rk_set_epilogue(rk_ctx *ctx, const float *bias, int relu) { ctx->epi_bias = bias; ctx->epi_relu = relu; }
+
+/* Find the entry for (key, kind, prec, shape); NULL if absent. */
+static struct wc_entry *wc_find(rk_ctx *ctx, int kind, int prec, const int *d, int nd) {
+	if (!ctx->wc_key || ctx->wc_max == 0) return NULL;
+	for (int i = 0; i < ctx->wc_n; i++) {
+		struct wc_entry *e = &ctx->wc[i];
+		if (e->key == ctx->wc_key && e->kind == kind && e->prec == prec && !memcmp(e->d, d, nd * sizeof(int))) {
+			e->last_use = ++ctx->wc_clock;
+			return e;
+		}
+	}
+	return NULL;
+}
+
+/* New (unpacked) entry; evicts least recently used ones to stay under the byte cap. */
+static struct wc_entry *wc_new(rk_ctx *ctx, int kind, int prec, const int *d, int nd, size_t bytes) {
+	if (!ctx->wc_key || ctx->wc_max == 0 || bytes > ctx->wc_max) return NULL;
+	rk_wcache_drop(ctx, ctx->wc_key);            /* stale shapes for this key */
+	while (ctx->wc_n > 0 && ctx->wc_bytes + bytes > ctx->wc_max) {
+		int lru = 0;
+		for (int i = 1; i < ctx->wc_n; i++) if (ctx->wc[i].last_use < ctx->wc[lru].last_use) lru = i;
+		wc_free_entry(ctx, &ctx->wc[lru]);
+		ctx->wc[lru] = ctx->wc[--ctx->wc_n];
+	}
+	if (ctx->wc_n == ctx->wc_cap) {
+		int cap = ctx->wc_cap ? ctx->wc_cap * 2 : 16;
+		struct wc_entry *n = realloc(ctx->wc, cap * sizeof(*n));
+		if (!n) return NULL;
+		ctx->wc = n;
+		ctx->wc_cap = cap;
+	}
+	struct wc_entry *e = &ctx->wc[ctx->wc_n++];
+	memset(e, 0, sizeof(*e));
+	e->key = ctx->wc_key; e->kind = kind; e->prec = prec;
+	memcpy(e->d, d, nd * sizeof(int));
+	e->last_use = ++ctx->wc_clock;
+	e->scale = 1.f;
+	return e;
+}
+
+/* Allocate the entry's NPU buffer; on failure the entry is dropped and NULL returned. */
+static int buf_ensure(rk_ctx *ctx, rk_buf *b, size_t size, uint32_t flags);
+static struct wc_entry *wc_alloc(rk_ctx *ctx, struct wc_entry *e, size_t bytes) {
+	uint32_t dflags = MEM_FLAG_400 | RKNPU_MEM_CACHEABLE | RKNPU_MEM_NON_CONTIGUOUS;
+	if (buf_ensure(ctx, &e->buf, bytes, dflags)) {
+		rk_wcache_drop(ctx, e->key);
+		return NULL;
+	}
+	ctx->wc_bytes += e->buf.size;
+	return e;
+}
+
 void rk_close(rk_ctx *ctx) {
 	if (!ctx) return;
+	rk_wcache_clear(ctx);
+	free(ctx->wc);
 	buf_free(ctx, &ctx->regcmd);
 	buf_free(ctx, &ctx->tasks);
 	buf_free(ctx, &ctx->a);
@@ -179,7 +284,9 @@ static void npu_unlock(rk_ctx *ctx) { if (ctx->lock_fd >= 0) flock(ctx->lock_fd,
 
 static void buf_free(rk_ctx *ctx, rk_buf *b);
 
+void rk_wcache_clear(rk_ctx *ctx);
 void rk_release(rk_ctx *ctx) {
+	rk_wcache_clear(ctx);
 	buf_free(ctx, &ctx->regcmd);
 	buf_free(ctx, &ctx->tasks);
 	buf_free(ctx, &ctx->a);
@@ -189,7 +296,7 @@ void rk_release(rk_ctx *ctx) {
 }
 
 size_t rk_buffer_bytes(rk_ctx *ctx) {
-	return ctx->a.size + ctx->b.size + ctx->c.size + ctx->regcmd.size + ctx->tasks.size;
+	return ctx->a.size + ctx->b.size + ctx->c.size + ctx->regcmd.size + ctx->tasks.size + ctx->wc_bytes;
 }
 
 int rk_query(rk_ctx *ctx, rk_info *info) {
@@ -289,6 +396,8 @@ typedef struct {
 	int nc1hwc2;            /* 1: native NC1HWC2 feature/output layout (convolution) */
 	int surf_in_h;          /* NC1HWC2: full input height (surface stride), 0 = in_h */
 	int surf_out_hw;        /* NC1HWC2: full output plane (oh*ow) for surface strides, 0 = slice */
+	int dw;                 /* depthwise convolution (CONV_MODE 3): one 2-D kernel per channel */
+	int relu;               /* ReLU in the DPU's BS stage */
 } task_desc;
 
 /* Register stream for one row-major matmul task (precisions from t->dt). */
@@ -307,7 +416,9 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	/* bit 29 (GROUP_LINE_OFF) with width 1 makes the CNA read A as a plain row-major matrix;
 	 * convolutions use the native NC1HWC2 layout instead (16-byte channel atoms). */
 	const int nc = t->nc1hwc2;
-	const uint32_t conv1 = (nc ? 0u : (1u << 29)) | ((uint32_t)dt->proc_prec << 7) | ((uint32_t)dt->in_prec << 4);
+	const uint32_t conv1 = (nc ? 0u : (1u << 29)) | ((uint32_t)dt->proc_prec << 7) | ((uint32_t)dt->in_prec << 4) |
+	                       (t->dw ? 3u : 0u);
+	const uint32_t wk = t->dw ? 1u : n;                                  /* weight kernels */
 	const uint32_t line_stride = nc ? 4 * iw : iw * kb / 16;
 	const uint32_t sih = (nc && t->surf_in_h) ? (uint32_t)t->surf_in_h : ih;
 	const uint32_t surf_stride = nc ? (uint32_t)((double)line_stride * ((double)sih / 4.0 - 1.0)) : 0;
@@ -328,9 +439,9 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_CNA, CNA_DATA_SIZE1, ((k - 1) << 16) | k);
 	R(OP_REG_CNA, CNA_DATA_SIZE2, ow & 0x7FF);
 	R(OP_REG_CNA, CNA_DATA_SIZE3, (ow * oh) & 0x3FFFF);
-	R(OP_REG_CNA, CNA_WEIGHT_SIZE0, kb * kw * kh * n);
+	R(OP_REG_CNA, CNA_WEIGHT_SIZE0, kb * kw * kh * wk);
 	R(OP_REG_CNA, CNA_WEIGHT_SIZE1, (kb * kw * kh) & 0x7FFFF);
-	R(OP_REG_CNA, CNA_WEIGHT_SIZE2, ((kw & 0x1F) << 24) | ((kh & 0x1F) << 16) | (n & 0x3FFF));
+	R(OP_REG_CNA, CNA_WEIGHT_SIZE2, ((kw & 0x1F) << 24) | ((kh & 0x1F) << 16) | (wk & 0x3FFF));
 	R(OP_REG_CNA, CNA_CBUF_CON0, cbuf);
 	R(OP_REG_CNA, CNA_CBUF_CON1, entries & 0x1FFF);
 	R(OP_REG_CNA, CNA_CVT_CON0, (1 << 3) | (1 << 1) | 1);
@@ -355,13 +466,13 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_CNA, CNA_CVT_CON5, 0);
 	R(OP_REG_CNA, CNA_PAD_CON1, 0);
 
-	R(OP_REG_CORE, CORE_MISC_CFG, ((uint32_t)dt->proc_prec << 8) | (uint32_t)dt->qd_en);
+	R(OP_REG_CORE, CORE_MISC_CFG, ((uint32_t)dt->proc_prec << 8) | (t->dw ? 2u : 0u) | (uint32_t)dt->qd_en);
 	R(OP_REG_CORE, CORE_DATAOUT_SIZE_0, ((oh - 1) << 16) | (ow - 1));
 	R(OP_REG_CORE, CORE_DATAOUT_SIZE_1, n - 1);
 	R(OP_REG_CORE, CORE_CLIP_TRUNCATE, 0);
 	R(OP_REG_CORE, CORE_3030, 0);
 
-	R(OP_REG_DPU, DPU_FEATURE_MODE_CFG, (15u << 5) | (2u << 1));
+	R(OP_REG_DPU, DPU_FEATURE_MODE_CFG, (15u << 5) | (t->dw ? 3u << 3 : 0u) | (2u << 1));
 	R(OP_REG_DPU, DPU_DATA_FORMAT, ((uint32_t)dt->out_prec << 29) | ((uint32_t)dt->proc_prec << 26) | (uint32_t)dt->proc_prec);
 	R(OP_REG_DPU, DPU_OFFSET_PEND, 0);
 	R(OP_REG_DPU, DPU_DST_BASE_ADD, t->out_dma);
@@ -370,7 +481,8 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_DPU, DPU_DATA_CUBE_HEIGHT, (oh - 1) & 0x1FFF);
 	R(OP_REG_DPU, DPU_DATA_CUBE_NOTCH_ADDR, nc ? 0 : ((notch << 16) | notch));
 	R(OP_REG_DPU, DPU_DATA_CUBE_CHANNEL, ((n - 1) << 16) | (n - 1));
-	R(OP_REG_DPU, DPU_BS_CFG, (1 << 6) | (1 << 4) | (1 << 1) | 1);
+	/* BS stage: everything bypassed, or (relu) only the ALU/multiplier bypassed so the ReLU runs */
+	R(OP_REG_DPU, DPU_BS_CFG, t->relu ? ((1 << 4) | (1 << 1)) : ((1 << 6) | (1 << 4) | (1 << 1) | 1));
 	R(OP_REG_DPU, DPU_BS_ALU_CFG, 0);
 	R(OP_REG_DPU, DPU_BS_MUL_CFG, 0);
 	R(OP_REG_DPU, DPU_BS_RELUX_CMP_VALUE, 0);
@@ -613,6 +725,10 @@ typedef struct {
 	int batch;                            /* independent GEMMs sharing one shape */
 	int64_t sa_b, sb_b, sc_b;             /* batch strides of A, B, C (elements) */
 	size_t a_bat, b_bat, c_bat;           /* NPU buffer elements per batch */
+	const float *bias;                    /* epilogue: + bias[n] */
+	int relu;                             /* epilogue: max(., 0) */
+	int relu_dpu;                         /* the ReLU already ran in the DPU */
+	struct wc_entry *wc;                  /* cached packed B (or NULL) */
 } job_t;
 
 /* write one converted element of A row m / B column n */
@@ -747,8 +863,23 @@ DEFINE_PACK_B(pack_b_f16_range, f16, 16, CONV_F16)
 DEFINE_PACK_B(pack_b_bf16_range, uint16_t, 16, CONV_BF16)
 DEFINE_PACK_B(pack_b_i8_range, int8_t, 32, CONV_I8)
 
+/* output epilogue on one finished row of C */
+static inline void epi_row(float *crow, int N, const float *bias, int relu) {
+	if (bias && relu) { for (int n = 0; n < N; n++) { float x = crow[n] + bias[n]; crow[n] = x > 0.f ? x : 0.f; } }
+	else if (bias) { for (int n = 0; n < N; n++) crow[n] += bias[n]; }
+	else if (relu) { for (int n = 0; n < N; n++) crow[n] = crow[n] > 0.f ? crow[n] : 0.f; }
+}
+
 /* C: row-major [Mp][Nc] tiles -> C, reducing K chunks and undoing input scales */
+static void unpack_core(void *v, int b, int e);
 static void unpack_range(void *v, int b, int e) {
+	job_t *J = v;
+	unpack_core(v, b, e);
+	int relu = J->relu && !J->relu_dpu;
+	if (J->bias || relu)
+		for (int m = b; m < e; m++) epi_row(J->C + (int64_t)m * J->ldc, J->N, J->bias, relu);
+}
+static void unpack_core(void *v, int b, int e) {
 	job_t *J = v;
 	const int ob = J->dt->out_prec;
 	if (ob == PREC_INT32 && J->nk == 1) {
@@ -968,21 +1099,29 @@ static int gemm_engine(rk_ctx *ctx, job_t *J) {
 	J->a_bat = a_chunk * nk; J->b_bat = b_tile * nk * nn; J->c_bat = c_tile * nk * nn;
 	size_t a_bytes = J->a_bat * nb * ib, b_bytes = J->b_bat * nb * ib, c_bytes = J->c_bat * nb * ob;
 	uint32_t dflags = MEM_FLAG_400 | RKNPU_MEM_CACHEABLE | RKNPU_MEM_NON_CONTIGUOUS;
+	struct wc_entry *wc = J->wc;
+	if (wc && wc->packed && (wc->layout[0] != Kc || wc->layout[1] != Nc || wc->layout[2] != nk || wc->layout[3] != nn))
+		wc = NULL;   /* packed for another tiling: don't use */
+	if (wc && !wc->packed) wc = wc_alloc(ctx, wc, b_bytes);
 	if (buf_ensure(ctx, &ctx->a, a_bytes, dflags) ||
-	    buf_ensure(ctx, &ctx->b, b_bytes, dflags) ||
+	    (!wc && buf_ensure(ctx, &ctx->b, b_bytes, dflags)) ||
 	    buf_ensure(ctx, &ctx->c, c_bytes, dflags) ||
 	    buf_ensure(ctx, &ctx->regcmd, (size_t)TT * REGCMD_SLOTS * 8, dflags) ||
 	    buf_ensure(ctx, &ctx->tasks, (size_t)TT * sizeof(struct rknpu_task), dflags | RKNPU_MEM_KERNEL_MAPPING))
 		return -1;
 
 	J->Mp = Mp; J->Kc = Kc; J->Nc = Nc; J->nk = nk; J->nn = nn;
-	J->ap = ctx->a.ptr; J->bp = ctx->b.ptr; J->cp = ctx->c.ptr;
+	J->ap = ctx->a.ptr; J->bp = wc ? wc->buf.ptr : ctx->b.ptr; J->cp = ctx->c.ptr;
+	const uint64_t b_dma = wc ? wc->buf.dma : ctx->b.dma;
+	const int pack_b = J->B && !(wc && wc->packed);
+	/* ReLU in the DPU when nothing is added after the NPU's own output */
+	J->relu_dpu = J->relu && !J->bias && nk == 1 && !J->accumulate && dt->out_prec != PREC_FP16;
 	J->a_chunk = a_chunk; J->b_tile = b_tile; J->c_tile = c_tile;
 	J->nblk = ceil_div(Mp, 16);
 
 	double t0 = now_us();
 	if (J->A) pfor_batched(ctx, J, nk * J->nblk, 4, pack_a_range);
-	if (J->B) {
+	if (pack_b) {
 		range_fn pb = pack_b_range;
 		if (J->cv == CV_F16 && G == 16) pb = pack_b_f16_range;
 		else if (J->cv == CV_BF16 && G == 16) pb = pack_b_bf16_range;
@@ -991,7 +1130,15 @@ static int gemm_engine(rk_ctx *ctx, job_t *J) {
 	}
 	ctx->stats.pack_us += now_us() - t0;
 	buf_sync(ctx, &ctx->a, a_bytes, RKNPU_MEM_SYNC_TO_DEVICE);
-	buf_sync(ctx, &ctx->b, b_bytes, RKNPU_MEM_SYNC_TO_DEVICE);
+	if (pack_b) {
+		buf_sync(ctx, wc ? &wc->buf : &ctx->b, b_bytes, RKNPU_MEM_SYNC_TO_DEVICE);
+		if (wc) {
+			wc->packed = 1;
+			wc->layout[0] = Kc; wc->layout[1] = Nc; wc->layout[2] = nk; wc->layout[3] = nn;
+		}
+	} else if (wc) {
+		ctx->stats.cache_hits++;
+	}
 
 	/* register streams: task order (j, c, i) so consecutive tasks share weights */
 	uint64_t *rc = ctx->regcmd.ptr;
@@ -1019,9 +1166,10 @@ static int gemm_engine(rk_ctx *ctx, job_t *J) {
 			.dt = dt, .m = Mt, .k = Kc, .n = Nc, .grains = Mt + 1, .dbanks = dbanks, .wbanks = wbanks,
 			.reuse = ctx->reuse && weights_fit && !first && i > 0,
 			.in_dma = (uint32_t)(ctx->a.dma + ((size_t)bb * J->a_bat + (size_t)j * a_chunk + (size_t)i * Mt * Kc) * ib),
-			.w_dma = (uint32_t)(ctx->b.dma + ((size_t)bb * J->b_bat + (size_t)jc * b_tile) * ib),
+			.w_dma = (uint32_t)(b_dma + ((size_t)bb * J->b_bat + (size_t)jc * b_tile) * ib),
 			.out_dma = (uint32_t)(ctx->c.dma + ((size_t)bb * J->c_bat + (size_t)jc * c_tile + (size_t)i * Mt * Nc) * ob),
 			.next_dma = last ? 0 : (uint32_t)(ctx->regcmd.dma + (size_t)(t + 1) * REGCMD_SLOTS * 8),
+			.relu = J->relu_dpu,
 		};
 		emit_task(rc + (size_t)t * REGCMD_SLOTS, &d);
 		struct rknpu_task td = {
@@ -1109,9 +1257,17 @@ static int gemm_front(rk_ctx *ctx, int prec, int batch, int M, int N, int K,
 		.M = M, .N = N, .K = K, .C = C, .ldc = ldc, .accumulate = accumulate,
 		.a_scale = 1.f, .b_scale = 1.f, .out_mul = 1.f,
 		.batch = batch, .sa_b = sa_b, .sb_b = sb_b, .sc_b = sc_b,
+		.bias = ctx->epi_bias, .relu = ctx->epi_relu,
 	};
 	int r = -1;
 	double t0;
+	/* packed-weight cache: B is the cached operand (single GEMM, single-pass precisions) */
+	const int wd[2] = { K, N };
+	struct wc_entry *hit = NULL, *fresh = NULL;
+	if (ctx->wc_key && batch == 1 && prec != RK_PREC_FP16X3) {
+		hit = wc_find(ctx, 1, prec, wd, 2);
+		if (hit && !hit->packed) { rk_wcache_drop(ctx, hit->key); hit = NULL; }
+	}
 	switch (prec) {
 	case RK_PREC_FP16:
 	case RK_PREC_BF16:
@@ -1122,11 +1278,16 @@ static int gemm_front(rk_ctx *ctx, int prec, int batch, int M, int N, int K,
 			/* exact power-of-two scaling keeps both operands inside fp16 range */
 			t0 = now_us();
 			J.a_scale = pow2_scale(amax_all(ctx, &J, M, amax_a_rows));
-			J.b_scale = pow2_scale(amax_all(ctx, &J, N, amax_b_cols));
+			J.b_scale = hit ? hit->scale : pow2_scale(amax_all(ctx, &J, N, amax_b_cols));
 			J.out_mul = 1.f / (J.a_scale * J.b_scale);
 			J.amax_part = NULL;
 			ctx->stats.pack_us += now_us() - t0;
 		}
+		if (!hit && ctx->wc_key && batch == 1) {
+			fresh = wc_new(ctx, 1, prec, wd, 2, (size_t)round_up(K, 32) * round_up(N, 32) * 2);
+			if (fresh) fresh->scale = J.b_scale;
+		}
+		J.wc = hit ? hit : fresh;
 		r = gemm_engine(ctx, &J);
 		break;
 	case RK_PREC_INT8: {
@@ -1139,11 +1300,22 @@ static int gemm_front(rk_ctx *ctx, int prec, int batch, int M, int N, int K,
 		if (!ra || !cb) { set_err(ctx, "out of memory"); return -1; }
 		amax_all(ctx, &J, M, amax_a_rows);
 		for (size_t m = 0; m < RA; m++) ra[m] = J.amax_part[m] > 0.f ? 127.f / J.amax_part[m] : 1.f;
-		amax_all(ctx, &J, N, amax_b_cols);
-		for (size_t n = 0; n < CB; n++) {
-			cb[n] = J.amax_part[n] > 0.f ? 127.f / J.amax_part[n] : 1.f;
-			cb[CB + n] = 1.f / cb[n];
+		if (hit) {
+			memcpy(cb, hit->col, 2 * CB * sizeof(float));
+		} else {
+			amax_all(ctx, &J, N, amax_b_cols);
+			for (size_t n = 0; n < CB; n++) {
+				cb[n] = J.amax_part[n] > 0.f ? 127.f / J.amax_part[n] : 1.f;
+				cb[CB + n] = 1.f / cb[n];
+			}
+			if (ctx->wc_key && batch == 1) {
+				fresh = wc_new(ctx, 1, prec, wd, 2, (size_t)round_up(K, 32) * round_up(N, 32));
+				if (fresh && (fresh->col = malloc(2 * CB * sizeof(float))))
+					memcpy(fresh->col, cb, 2 * CB * sizeof(float));
+				else if (fresh) { rk_wcache_drop(ctx, fresh->key); fresh = NULL; }
+			}
 		}
+		J.wc = hit ? hit : fresh;
 		J.a_row = ra;
 		J.b_col = cb;
 		J.b_inv = cb + CB;
@@ -1175,6 +1347,7 @@ static int gemm_front(rk_ctx *ctx, int prec, int batch, int M, int N, int K,
 		J.amax_part = NULL;
 		/* pass 1: Ah (first K columns of A2) x Bh (rows K..2K-1 of B2) */
 		job_t P = J;
+		P.bias = NULL; P.relu = 0;
 		P.dt = &DT_F16_F32; P.cv = CV_F16;
 		P.A = A2; P.sa_m = 2 * K; P.sa_k = 1;
 		P.B = B2 + (size_t)K * N; P.sb_k = N; P.sb_n = 1;
@@ -1293,7 +1466,7 @@ int rk_probe_raw(rk_ctx *ctx, const rk_probe_cfg *cfg, int M, int N, int K,
 int rk_conv_raw(rk_ctx *ctx, const rk_conv_cfg *c, const void *in_nhwc, const void *w_bytes, void *out_nhwc) {
 	const dtype_t *dt = &DT_F16_F32;
 	/* c->c must be a multiple of 8 (fp16 atoms), c->n a multiple of 16 */
-	size_t in_b = (size_t)c->h * c->w * c->c * 2, w_b = (size_t)c->n * c->kh * c->kw * c->c * 2;
+	size_t in_b = (size_t)c->h * c->w * c->c * 2, w_b = (size_t)(c->dw ? 1 : c->n) * c->kh * c->kw * c->c * 2;
 	size_t out_b = (size_t)c->oh * c->ow * c->n * 4;
 	uint32_t dflags = MEM_FLAG_400 | RKNPU_MEM_CACHEABLE | RKNPU_MEM_NON_CONTIGUOUS;
 	if (buf_ensure(ctx, &ctx->a, in_b, dflags) || buf_ensure(ctx, &ctx->b, w_b, dflags) ||
@@ -1312,7 +1485,8 @@ int rk_conv_raw(rk_ctx *ctx, const rk_conv_cfg *c, const void *in_nhwc, const vo
 	                .dbanks = dbanks, .wbanks = wbanks, .reuse = 0, .in_dma = (uint32_t)ctx->a.dma,
 	                .w_dma = (uint32_t)ctx->b.dma, .out_dma = (uint32_t)ctx->c.dma, .next_dma = 0,
 	                .in_w = c->w, .in_h = c->h, .out_w = c->ow, .out_h = c->oh, .kw = c->kw, .kh = c->kh,
-	                .sx = c->sx, .sy = c->sy, .pl = c->pl, .pt = c->pt, .nc1hwc2 = c->layout };
+	                .sx = c->sx, .sy = c->sy, .pl = c->pl, .pt = c->pt, .nc1hwc2 = c->layout,
+	                .dw = c->dw, .relu = c->relu };
 	emit_task(ctx->regcmd.ptr, &d);
 	struct rknpu_task td = { .enable_mask = 0xd, .int_mask = 0x300, .int_clear = 0x1ffff,
 	                         .regcfg_amount = REGCFG_AMOUNT, .regcmd_addr = ctx->regcmd.dma };
@@ -1335,41 +1509,52 @@ typedef struct {
 	const float *x, *w;
 	float *y;
 	int N, C, H, W, O, kh, kw, oh, ow;
+	int G, Cg, Og;                 /* groups, input / output channels per group */
 	int Cp, Cc, nk, Op;
 	f16 *xp, *wp;                  /* packed fp16 (or bf16 bits) */
 	float *yp;
 	int bf16;
 	float xs, ws, out_mul;
 	int accumulate;
-	size_t x_img, x_chunk, w_chunk, y_img, y_chunk;   /* elements */
+	const float *bias;             /* epilogue: + bias[o] */
+	int relu, relu_dpu;
+	size_t x_img, x_chunk, w_chunk, y_img, y_chunk;   /* elements (per group) */
+	size_t x_grp, w_grp, y_grp;                       /* elements per group */
 } conv_job;
 
-/* x: items (b, chunk j, c1 group of 8 channels) -> [C1][H][W][8] */
+static inline uint16_t h16(conv_job *J, float v) {
+	if (J->bf16) return f32_to_bf16(v);
+	f16 h = (f16)v;
+	uint16_t u;
+	memcpy(&u, &h, 2);
+	return u;
+}
+
+/* x: items (group, b, chunk j, c1 group of 8 channels) -> [C1][H][W][8] */
 static void conv_pack_x(void *v, int b, int e) {
 	conv_job *J = v;
-	const int HW = J->H * J->W, g = J->Cc / 8;
+	const int HW = J->H * J->W, g8 = J->Cc / 8;
 	for (int it = b; it < e; it++) {
-		int c1 = it % g, j = (it / g) % J->nk, bb = it / (g * J->nk);
-		uint16_t *d = (uint16_t *)J->xp + (size_t)bb * J->x_img + (size_t)j * J->x_chunk + (size_t)c1 * HW * 8;
+		int c1 = it % g8, j = (it / g8) % J->nk, bb = (it / (g8 * J->nk)) % J->N, gr = it / (g8 * J->nk * J->N);
+		uint16_t *d = (uint16_t *)J->xp + (size_t)gr * J->x_grp + (size_t)bb * J->x_img + (size_t)j * J->x_chunk +
+		              (size_t)c1 * HW * 8;
 		int c0 = j * J->Cc + c1 * 8;
 		const float *src[8];
 		for (int t = 0; t < 8; t++)
-			src[t] = (c0 + t < J->C) ? J->x + ((size_t)bb * J->C + c0 + t) * HW : NULL;
+			src[t] = (c0 + t < J->Cg) ? J->x + ((size_t)bb * J->C + (size_t)gr * J->Cg + c0 + t) * HW : NULL;
 		for (int p = 0; p < HW; p++)
-			for (int t = 0; t < 8; t++) {
-				float v0 = src[t] ? src[t][p] * J->xs : 0.f;
-				d[(size_t)p * 8 + t] = J->bf16 ? f32_to_bf16(v0) : ({ f16 h = (f16)v0; uint16_t u; memcpy(&u, &h, 2); u; });
-			}
+			for (int t = 0; t < 8; t++)
+				d[(size_t)p * 8 + t] = h16(J, src[t] ? src[t][p] * J->xs : 0.f);
 	}
 }
 
-/* w: items (chunk j, 16-kernel group) -> [Cc/32][kh][kw][16][32] */
+/* w (O, Cg, kh, kw): items (group, chunk j, 16-kernel group) -> [Cc/32][kh][kw][16][32] */
 static void conv_pack_w(void *v, int b, int e) {
 	conv_job *J = v;
 	const int ng = J->Op / 16, khw = J->kh * J->kw;
 	for (int it = b; it < e; it++) {
-		int og = it % ng, j = it / ng;
-		uint16_t *d = (uint16_t *)J->wp + (size_t)j * J->w_chunk + (size_t)og * 16 * J->Cc * khw;
+		int og = it % ng, j = (it / ng) % J->nk, gr = it / (ng * J->nk);
+		uint16_t *d = (uint16_t *)J->wp + (size_t)gr * J->w_grp + (size_t)j * J->w_chunk + (size_t)og * 16 * J->Cc * khw;
 		size_t n = 0;
 		for (int cb = 0; cb < J->Cc / 32; cb++)
 			for (int ky = 0; ky < J->kh; ky++)
@@ -1377,52 +1562,80 @@ static void conv_pack_w(void *v, int b, int e) {
 					for (int o2 = 0; o2 < 16; o2++)
 						for (int c2 = 0; c2 < 32; c2++) {
 							int o = og * 16 + o2, c = j * J->Cc + cb * 32 + c2;
-							float v0 = (o < J->O && c < J->C) ? J->w[(((size_t)o * J->C + c) * J->kh + ky) * J->kw + kx] * J->ws : 0.f;
-							d[n++] = J->bf16 ? f32_to_bf16(v0) : ({ f16 h = (f16)v0; uint16_t u; memcpy(&u, &h, 2); u; });
+							float v0 = (o < J->Og && c < J->Cg)
+							           ? J->w[((((size_t)gr * J->Og + o) * J->Cg + c) * J->kh + ky) * J->kw + kx] * J->ws : 0.f;
+							d[n++] = h16(J, v0);
 						}
 	}
 }
 
-/* y: items (b, o) -> NCHW plane, summing channel chunks; source [Op/4][oh][ow][4] */
+/* y: items (b, o) -> NCHW plane, summing channel chunks; source [Op/4][oh][ow][4] per group */
 static void conv_unpack_y(void *v, int b, int e) {
 	conv_job *J = v;
 	const int OHW = J->oh * J->ow;
+	const int relu = J->relu && !J->relu_dpu;
 	for (int it = b; it < e; it++) {
-		int o = it % J->O, bb = it / J->O;
+		int o = it % J->O, bb = it / J->O, gr = o / J->Og, ol = o % J->Og;
 		float *d = J->y + ((size_t)bb * J->O + o) * OHW;
+		const float *src = J->yp + (size_t)gr * J->y_grp + (size_t)bb * J->y_img + (size_t)(ol / 4) * OHW * 4 + (ol & 3);
+		const float bias = J->bias ? J->bias[o] : 0.f;
 		for (int p = 0; p < OHW; p++) {
 			float acc = 0.f;
-			for (int j = 0; j < J->nk; j++)
-				acc += J->yp[(size_t)bb * J->y_img + (size_t)j * J->y_chunk + ((size_t)(o / 4) * OHW + p) * 4 + (o & 3)];
+			for (int j = 0; j < J->nk; j++) acc += src[(size_t)j * J->y_chunk + (size_t)p * 4];
 			acc *= J->out_mul;
-			if (J->accumulate) d[p] += acc; else d[p] = acc;
+			if (J->accumulate) acc += d[p];
+			acc += bias;
+			if (relu && acc < 0.f) acc = 0.f;
+			d[p] = acc;
 		}
 	}
 }
 
-int rk_conv2d(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float *x,
-              int O, int kh, int kw, const float *w, int sy, int sx, int pt, int pl,
-              int oh, int ow, float *y, int accumulate) {
-	double t_start = now_us();
-	memset(&ctx->stats, 0, sizeof(ctx->stats));
+typedef struct { const float *p; size_t n; uint32_t *part; } amax_job;
+static void amax_flat(void *v, int b, int e) {
+	amax_job *A = v;
+	for (int it = b; it < e; it++) {
+		size_t i0 = (size_t)it * 65536, i1 = i0 + 65536 < A->n ? i0 + 65536 : A->n;
+		const uint32_t *s = (const uint32_t *)A->p;
+		uint32_t x = 0;
+		for (size_t i = i0; i < i1; i++) { uint32_t a = s[i] & 0x7fffffffu; x = a > x ? a : x; }
+		A->part[it] = x;
+	}
+}
+static float amax_par(rk_ctx *ctx, const float *p, size_t n) {
+	int items = (int)((n + 65535) / 65536);
+	uint32_t *part = (uint32_t *)scratch(ctx, 0, (size_t)items);
+	if (!part) { float m = 0.f; for (size_t i = 0; i < n; i++) m = fabsf(p[i]) > m ? fabsf(p[i]) : m; return m; }
+	amax_job A = { p, n, part };
+	parallel_for(ctx, items, 1, amax_flat, &A);
+	uint32_t m = 0;
+	for (int i = 0; i < items; i++) m = part[i] > m ? part[i] : m;
+	return bitsf(m);
+}
+
+int rk_conv2d_ex(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float *x,
+                 int O, int kh, int kw, const float *w, int sy, int sx, int pt, int pl,
+                 int oh, int ow, float *y, int accumulate, int groups) {
 	if (N <= 0 || C <= 0 || H <= 0 || W <= 0 || O <= 0 || kh <= 0 || kw <= 0 || oh <= 0 || ow <= 0 ||
 	    kh > 31 || kw > 31 || sy < 1 || sx < 1 || sy > 7 || sx > 7 || pt < 0 || pl < 0 || pt > 15 || pl > 15 ||
-	    W > 2047 || H > 2047) {
+	    W > 2047 || H > 2047 || groups < 1 || C % groups || O % groups) {
 		set_err(ctx, "unsupported convolution geometry");
 		return -1;
 	}
 	const dtype_t *dt = prec == RK_PREC_BF16 ? &DT_BF16_F32 : &DT_F16_F32;
+	const int G = groups, Cg = C / G, Og = O / G;
 	conv_job J = { .x = x, .w = w, .y = y, .N = N, .C = C, .H = H, .W = W, .O = O, .kh = kh, .kw = kw,
-	               .oh = oh, .ow = ow, .bf16 = prec == RK_PREC_BF16, .xs = 1.f, .ws = 1.f, .out_mul = 1.f,
-	               .accumulate = accumulate };
+	               .oh = oh, .ow = ow, .G = G, .Cg = Cg, .Og = Og, .bf16 = prec == RK_PREC_BF16,
+	               .xs = 1.f, .ws = 1.f, .out_mul = 1.f, .accumulate = accumulate,
+	               .bias = ctx->epi_bias, .relu = ctx->epi_relu };
 	const int khw = kh * kw;
 	/* channel chunks: a 16-kernel weight group must fit in <= 8 banks, and one input row in the rest */
-	int Cp = round_up(C, 32), Cc = Cp;
+	int Cp = round_up(Cg, 32), Cc = Cp;
 	while (Cc > 32 && (16L * khw * Cc * 2 > 8L * CBUF_BANK_SIZE)) Cc = round_up(Cc / 2, 32);
 	int nk = ceil_div(Cp, Cc);
 	Cc = round_up(ceil_div(Cp, nk), 32);
 	Cp = Cc * nk;
-	int Op = round_up(O, 16);
+	int Op = round_up(Og, 16);
 	if (Op > 4096) { set_err(ctx, "too many output channels (%d) for one convolution", O); return -1; }
 	J.Cp = Cp; J.Cc = Cc; J.nk = nk; J.Op = Op;
 	/* CBUF split */
@@ -1432,9 +1645,12 @@ int rk_conv2d(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float *x,
 	int dbanks_max = CBUF_BANKS - wbanks;
 	long entries_row = (W * 2L * (Cc / 8) + 7) / 8;                  /* CBUF entries (128 B) per input row */
 	long rows_fit = (dbanks_max * 256L) / entries_row;                /* input rows that fit */
-	if (rows_fit < kh + 2) { set_err(ctx, "image row too wide for CBUF (W=%d, C=%d)", W, C); return -1; }
+	if (rows_fit < kh + 2) { set_err(ctx, "image row too wide for CBUF (W=%d, C=%d)", W, Cg); return -1; }
 	/* output rows per slice: (rows-1)*sy + kh input rows (+1 preload) must fit */
 	int orows = (int)((rows_fit - 1 - kh) / sy) + 1;
+	/* FEATURE_GRAINS (input rows + 1) is a 10-bit field */
+	int orows_grains = (1022 - kh) / sy + 1;
+	if (orows > orows_grains) orows = orows_grains;
 	if (orows > oh) orows = oh;
 	int nslice = ceil_div(oh, orows);
 	orows = ceil_div(oh, nslice);
@@ -1444,50 +1660,69 @@ int rk_conv2d(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float *x,
 	if (dbanks_all > dbanks_max) dbanks_all = dbanks_max;
 	wbanks = CBUF_BANKS - dbanks_all;
 	int weights_fit = wall <= (long)wbanks * CBUF_BANK_SIZE;
-	int T = N * nk * nslice;
-	ctx->stats.tasks = T;
+	int T = G * N * nk * nslice;
+	if (T > 64 * PC_TASK_LIMIT) { set_err(ctx, "convolution needs too many NPU tasks (%d)", T); return -1; }
 
-	J.x_chunk = (size_t)Cc * H * W; J.x_img = J.x_chunk * nk;
-	J.w_chunk = (size_t)Op * khw * Cc;
-	J.y_chunk = (size_t)Op * oh * ow; J.y_img = J.y_chunk * nk;
-	size_t xb = J.x_img * N * 2, wb = J.w_chunk * nk * 2, yb = J.y_img * N * 4;
+	J.x_chunk = (size_t)Cc * H * W; J.x_img = J.x_chunk * nk; J.x_grp = J.x_img * N;
+	J.w_chunk = (size_t)Op * khw * Cc; J.w_grp = J.w_chunk * nk;
+	J.y_chunk = (size_t)Op * oh * ow; J.y_img = J.y_chunk * nk; J.y_grp = J.y_img * N;
+	size_t xb = J.x_grp * G * 2, wb = J.w_grp * G * 2, yb = J.y_grp * G * 4;
 	uint32_t dflags = MEM_FLAG_400 | RKNPU_MEM_CACHEABLE | RKNPU_MEM_NON_CONTIGUOUS;
 	if (xb + wb + yb > ctx->max_buf * 2 && N > 1) {
-		/* split the batch to bound NPU memory */
+		/* split the batch to bound NPU memory (the weight cache entry is reused by both halves) */
 		int n1 = N / 2;
-		int r = rk_conv2d(ctx, prec, n1, C, H, W, x, O, kh, kw, w, sy, sx, pt, pl, oh, ow, y, accumulate);
+		int r = rk_conv2d_ex(ctx, prec, n1, C, H, W, x, O, kh, kw, w, sy, sx, pt, pl, oh, ow, y, accumulate, groups);
 		if (r) return r;
-		return rk_conv2d(ctx, prec, N - n1, C, H, W, x + (size_t)n1 * C * H * W, O, kh, kw, w, sy, sx, pt, pl, oh, ow,
-		                 y + (size_t)n1 * O * oh * ow, accumulate);
+		return rk_conv2d_ex(ctx, prec, N - n1, C, H, W, x + (size_t)n1 * C * H * W, O, kh, kw, w, sy, sx, pt, pl, oh, ow,
+		                    y + (size_t)n1 * O * oh * ow, accumulate, groups);
 	}
-	if (buf_ensure(ctx, &ctx->a, xb, dflags) || buf_ensure(ctx, &ctx->b, wb, dflags) ||
+	ctx->stats.tasks += T;
+
+	/* packed-weight cache */
+	const int wd[6] = { O, Cg, kh, kw, G, Cc };
+	struct wc_entry *wc = NULL;
+	int pack_w = 1;
+	if (ctx->wc_key) {
+		wc = wc_find(ctx, 2, prec, wd, 6);
+		if (wc && wc->packed) pack_w = 0;
+		else {
+			if (wc) rk_wcache_drop(ctx, wc->key);
+			wc = wc_new(ctx, 2, prec, wd, 6, wb);
+			if (wc) wc = wc_alloc(ctx, wc, wb);
+		}
+	}
+	if (buf_ensure(ctx, &ctx->a, xb, dflags) || (!wc && buf_ensure(ctx, &ctx->b, wb, dflags)) ||
 	    buf_ensure(ctx, &ctx->c, yb, dflags) ||
 	    buf_ensure(ctx, &ctx->regcmd, (size_t)T * REGCMD_SLOTS * 8, dflags) ||
 	    buf_ensure(ctx, &ctx->tasks, (size_t)T * sizeof(struct rknpu_task), dflags | RKNPU_MEM_KERNEL_MAPPING))
 		return -1;
-	J.xp = ctx->a.ptr; J.wp = ctx->b.ptr; J.yp = ctx->c.ptr;
+	J.xp = ctx->a.ptr; J.wp = wc ? wc->buf.ptr : ctx->b.ptr; J.yp = ctx->c.ptr;
+	const uint64_t w_dma = wc ? wc->buf.dma : ctx->b.dma;
+	J.relu_dpu = J.relu && !J.bias && nk == 1 && !accumulate;
 
 	double t0 = now_us();
 	if (!J.bf16 && ctx->autoscale) {
-		float mx = 0.f, mw = 0.f;
-		size_t nx = (size_t)N * C * H * W, nw = (size_t)O * C * khw;
-		for (size_t i = 0; i < nx; i++) { float a = fabsf(x[i]); mx = a > mx ? a : mx; }
-		for (size_t i = 0; i < nw; i++) { float a = fabsf(w[i]); mw = a > mw ? a : mw; }
-		J.xs = pow2_scale(mx); J.ws = pow2_scale(mw);
+		J.xs = pow2_scale(amax_par(ctx, x, (size_t)N * C * H * W));
+		J.ws = pack_w ? pow2_scale(amax_par(ctx, w, (size_t)O * Cg * khw)) : wc->scale;
 		J.out_mul = 1.f / (J.xs * J.ws);
 	}
-	parallel_for(ctx, N * nk * (Cc / 8), 1, conv_pack_x, &J);
-	parallel_for(ctx, nk * (Op / 16), 1, conv_pack_w, &J);
-	ctx->stats.pack_us = now_us() - t0;
+	parallel_for(ctx, G * N * nk * (Cc / 8), 1, conv_pack_x, &J);
+	if (pack_w) parallel_for(ctx, G * nk * (Op / 16), 1, conv_pack_w, &J);
+	ctx->stats.pack_us += now_us() - t0;
 	buf_sync(ctx, &ctx->a, xb, RKNPU_MEM_SYNC_TO_DEVICE);
-	buf_sync(ctx, &ctx->b, wb, RKNPU_MEM_SYNC_TO_DEVICE);
+	if (pack_w) {
+		buf_sync(ctx, wc ? &wc->buf : &ctx->b, wb, RKNPU_MEM_SYNC_TO_DEVICE);
+		if (wc) { wc->packed = 1; wc->scale = J.ws; }
+	} else {
+		ctx->stats.cache_hits++;
+	}
 
 	uint64_t *rc = ctx->regcmd.ptr;
 	struct rknpu_task *tk = ctx->tasks.ptr;
 	int cores = ctx->mode == 2 ? 3 : 1;
 	int per_submit = ctx->mode == 0 ? 1 : PC_TASK_LIMIT;
 	for (int t = 0; t < T; t++) {
-		int sl = t % nslice, j = (t / nslice) % nk, bb = t / (nslice * nk);
+		int sl = t % nslice, j = (t / nslice) % nk, bb = (t / (nslice * nk)) % N, gr = t / (nslice * nk * N);
 		int r0 = sl * orows, r1 = r0 + orows < oh ? r0 + orows : oh;
 		int in0 = r0 * sy - pt, in1 = (r1 - 1) * sy - pt + kh;
 		int ptop = in0 < 0 ? -in0 : 0;
@@ -1509,18 +1744,21 @@ int rk_conv2d(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float *x,
 		}
 		int in_rows = in1 - in0;
 		/* the same CBUF split for every task: the weight-reuse bit assumes weights stay in
-		 * the same banks, which breaks if an edge slice (fewer rows) moved the boundary */
+		 * the same banks, which breaks if an edge slice (fewer rows) moved the boundary.
+		 * A new group (bb == 0 && sl == 0) brings new weights. */
 		int dbanks = dbanks_all;
+		size_t xo = (size_t)gr * J.x_grp + (size_t)bb * J.x_img + (size_t)j * J.x_chunk + (size_t)in0 * W * 8;
+		size_t yo = (size_t)gr * J.y_grp + (size_t)bb * J.y_img + (size_t)j * J.y_chunk + (size_t)r0 * ow * 4;
 		task_desc d = {
 			.dt = dt, .m = in_rows, .k = Cc, .n = Op, .grains = in_rows + 1,
 			.dbanks = dbanks, .wbanks = CBUF_BANKS - dbanks,
 			.reuse = ctx->reuse && weights_fit && !first && (sl > 0 || bb > 0) && nk == 1,
-			.in_dma = (uint32_t)(ctx->a.dma + ((size_t)bb * J.x_img + (size_t)j * J.x_chunk + (size_t)in0 * W * 8) * 2),
-			.w_dma = (uint32_t)(ctx->b.dma + (size_t)j * J.w_chunk * 2),
-			.out_dma = (uint32_t)(ctx->c.dma + ((size_t)bb * J.y_img + (size_t)j * J.y_chunk + (size_t)r0 * ow * 4) * 4),
+			.in_dma = (uint32_t)(ctx->a.dma + xo * 2),
+			.w_dma = (uint32_t)(w_dma + ((size_t)gr * J.w_grp + (size_t)j * J.w_chunk) * 2),
+			.out_dma = (uint32_t)(ctx->c.dma + yo * 4),
 			.next_dma = last ? 0 : (uint32_t)(ctx->regcmd.dma + (size_t)(t + 1) * REGCMD_SLOTS * 8),
 			.in_w = W, .in_h = in_rows, .out_w = ow, .out_h = r1 - r0, .kw = kw, .kh = kh, .sx = sx, .sy = sy,
-			.pl = pl, .pt = ptop, .nc1hwc2 = 1, .surf_in_h = H, .surf_out_hw = oh * ow,
+			.pl = pl, .pt = ptop, .nc1hwc2 = 1, .surf_in_h = H, .surf_out_hw = oh * ow, .relu = J.relu_dpu,
 		};
 		emit_task(rc + (size_t)t * REGCMD_SLOTS, &d);
 		struct rknpu_task td = {
@@ -1540,7 +1778,22 @@ int rk_conv2d(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float *x,
 	buf_sync(ctx, &ctx->c, yb, RKNPU_MEM_SYNC_FROM_DEVICE);
 	t0 = now_us();
 	parallel_for(ctx, N * O, 4, conv_unpack_y, &J);
-	ctx->stats.unpack_us = now_us() - t0;
-	ctx->stats.total_us = now_us() - t_start;
+	ctx->stats.unpack_us += now_us() - t0;
 	return 0;
+}
+
+int rk_conv2d_grouped(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float *x,
+                      int O, int kh, int kw, const float *w, int sy, int sx, int pt, int pl,
+                      int oh, int ow, float *y, int accumulate, int groups) {
+	double t_start = now_us();
+	memset(&ctx->stats, 0, sizeof(ctx->stats));
+	int r = rk_conv2d_ex(ctx, prec, N, C, H, W, x, O, kh, kw, w, sy, sx, pt, pl, oh, ow, y, accumulate, groups);
+	ctx->stats.total_us = now_us() - t_start;
+	return r;
+}
+
+int rk_conv2d(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float *x,
+              int O, int kh, int kw, const float *w, int sy, int sx, int pt, int pl,
+              int oh, int ow, float *y, int accumulate) {
+	return rk_conv2d_grouped(ctx, prec, N, C, H, W, x, O, kh, kw, w, sy, sx, pt, pl, oh, ow, y, accumulate, 1);
 }

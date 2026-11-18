@@ -4,11 +4,12 @@
         loss = model(x).sum()
         loss.backward()
 
-Inside the context, F.linear, matmul / mm / bmm / addmm / baddbmm,
-F.scaled_dot_product_attention and F.conv2d on CPU float tensors run on the NPU (forward
-and backward); every other op stays on the CPU. Convolutions use the NPU's native
-convolution engine (groups=1, dilation=1; others fall back to the CPU). If no NPU is
-available everything simply runs on the CPU.
+Inside the context, F.linear, matmul / mm / bmm / addmm / baddbmm, two-operand
+torch.einsum, F.scaled_dot_product_attention, F.conv1d / F.conv2d and F.conv_transpose2d
+on CPU float tensors run on the NPU (forward and backward); every other op stays on the
+CPU. Convolutions use the NPU's native convolution engine (dilation 1; grouped convolutions
+when the groups aren't too thin; depthwise ones stay on the CPU). Biases are added in the
+NPU library's output stage. If no NPU is available everything simply runs on the CPU.
 """
 import torch
 import torch.nn.functional as F
@@ -21,6 +22,7 @@ _BMM_FUNCS = {torch.bmm, torch.Tensor.bmm}
 _ADDMM_FUNCS = {torch.addmm, torch.Tensor.addmm}
 _BADDBMM_FUNCS = {torch.baddbmm, torch.Tensor.baddbmm}
 _SDPA = getattr(F, "scaled_dot_product_attention", None)
+_EINSUM = {torch.einsum, torch.functional.einsum} if hasattr(torch, "functional") else {torch.einsum}
 
 
 def _tensors_ok(*ts):
@@ -113,15 +115,35 @@ class NPUMode(TorchFunctionMode):
                 if _big_enough(q.numel() // max(E, 1) * S * E):
                     return ops.scaled_dot_product_attention(q, k, v, **params)
             return None
-        if self.conv and func is F.conv2d:
+        if self.conv and func in (F.conv2d, F.conv1d):
             x, w = args[0], args[1]
             names = ["bias", "stride", "padding", "dilation", "groups"]
             params = dict(zip(names, args[2:]))
             params.update(kwargs)
             b = params.get("bias")
-            if _tensors_ok(x, w) and (b is None or _tensors_ok(b)) and x.dim() == 4:
-                return ops.conv2d(x, w, b, params.get("stride", 1), params.get("padding", 0),
-                                  params.get("dilation", 1), params.get("groups", 1))
+            if _tensors_ok(x, w) and (b is None or _tensors_ok(b)):
+                fn = ops.conv2d if func is F.conv2d else ops.conv1d
+                return fn(x, w, b, params.get("stride", 1), params.get("padding", 0),
+                          params.get("dilation", 1), params.get("groups", 1))
+            return None
+        if self.conv and func is F.conv_transpose2d:
+            x, w = args[0], args[1]
+            names = ["bias", "stride", "padding", "output_padding", "groups", "dilation"]
+            params = dict(zip(names, args[2:]))
+            params.update(kwargs)
+            b = params.get("bias")
+            if _tensors_ok(x, w) and (b is None or _tensors_ok(b)):
+                return ops.conv_transpose2d(x, w, b, params.get("stride", 1), params.get("padding", 0),
+                                            params.get("output_padding", 0), params.get("groups", 1),
+                                            params.get("dilation", 1))
+            return None
+        if self.matmul and func in _EINSUM and not kwargs:
+            eq, ops_ = (args[0], args[1:]) if args and isinstance(args[0], str) else (None, ())
+            if len(ops_) == 1 and isinstance(ops_[0], (list, tuple)):
+                ops_ = tuple(ops_[0])
+            if eq is not None and len(ops_) == 2 and _tensors_ok(*ops_):
+                if _big_enough(ops.einsum_macs(eq, *ops_)):
+                    return ops.einsum(eq, *ops_)
             return None
         return None
 
@@ -150,37 +172,94 @@ def disable():
 
 
 class NPULinear(torch.nn.Linear):
-    """nn.Linear whose matmuls run on the NPU (works without npu_mode, and with torch.compile)."""
+    """nn.Linear whose matmuls run on the NPU (works without npu_mode, and with torch.compile).
+    `fused_relu` (set by convert() for Linear -> ReLU in a Sequential) applies the ReLU in
+    the NPU output stage."""
+    fused_relu = False
 
     def forward(self, x):
-        if (ops._enabled and ops._usable(x, self.weight)
+        act = "relu" if self.fused_relu else None
+        if (ops._enabled and ops._usable(x, self.weight) and (self.bias is None or ops._usable(self.bias))
                 and x.numel() // max(x.shape[-1], 1) * self.weight.shape[0] * self.weight.shape[1] >= ops.threshold()):
-            return ops.linear(x, self.weight, self.bias)
-        return F.linear(x, self.weight, self.bias)
+            return ops.linear(x, self.weight, self.bias, act)
+        y = F.linear(x, self.weight, self.bias)
+        return F.relu(y) if self.fused_relu else y
 
 
 class NPUConv2d(torch.nn.Conv2d):
     """nn.Conv2d whose convolution runs on the NPU (works without npu_mode, and with torch.compile)."""
+    fused_relu = False
 
     def forward(self, x):
         if (self.padding_mode == "zeros" and isinstance(self.padding, tuple) and ops._enabled
-                and ops._usable(x, self.weight)
+                and ops._usable(x, self.weight) and x.dim() == 4
                 and ops.conv_supported(x, self.weight, self.stride, self.padding, self.dilation, self.groups)):
-            y = ops.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+            y = ops.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups,
+                           "relu" if self.fused_relu else None)
             if y is not None:
                 return y
-        return super().forward(x)
+        y = super().forward(x)
+        return F.relu(y) if self.fused_relu else y
 
 
-_SWAP = {torch.nn.Linear: NPULinear, torch.nn.Conv2d: NPUConv2d}
+class NPUConv1d(torch.nn.Conv1d):
+    """nn.Conv1d on the NPU (as a height-1 2-D convolution)."""
+    fused_relu = False
+
+    def forward(self, x):
+        if (self.padding_mode == "zeros" and isinstance(self.padding, tuple) and ops._enabled
+                and ops._usable(x, self.weight)):
+            y = ops.conv1d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups,
+                           "relu" if self.fused_relu else None)
+            if y is not None:
+                return y
+        y = super().forward(x)
+        return F.relu(y) if self.fused_relu else y
 
 
-def convert(model):
-    """Swap every nn.Linear / nn.Conv2d in `model` for its NPU version, in place (weights are
-    shared, state_dict keys unchanged). Returns model."""
+class NPUConvTranspose2d(torch.nn.ConvTranspose2d):
+    """nn.ConvTranspose2d on the NPU (a GEMM when kernel == stride, else a convolution)."""
+
+    def forward(self, x, output_size=None):
+        if self.padding_mode == "zeros" and ops._enabled and ops._usable(x, self.weight):
+            op = self._output_padding(x, output_size, self.stride, self.padding, self.kernel_size, 2, self.dilation)
+            y = ops.conv_transpose2d(x, self.weight, self.bias, self.stride, self.padding, op, self.groups,
+                                     self.dilation)
+            if y is not None:
+                return y
+        return super().forward(x, output_size)
+
+
+class _FusedReLU(torch.nn.Module):
+    """Placeholder for a ReLU that convert() folded into the preceding NPU layer."""
+
+    def forward(self, x):
+        return x
+
+    def extra_repr(self):
+        return "fused into the previous layer"
+
+
+_SWAP = {torch.nn.Linear: NPULinear, torch.nn.Conv2d: NPUConv2d, torch.nn.Conv1d: NPUConv1d,
+         torch.nn.ConvTranspose2d: NPUConvTranspose2d}
+_FUSABLE = (NPULinear, NPUConv2d, NPUConv1d)
+
+
+def convert(model, fuse_relu=True):
+    """Swap every nn.Linear / nn.Conv1d / nn.Conv2d / nn.ConvTranspose2d in `model` for its NPU
+    version, in place (weights are shared, state_dict keys unchanged). With fuse_relu, a
+    Linear/Conv followed by nn.ReLU inside an nn.Sequential runs the ReLU in the NPU output
+    stage (the ReLU module becomes a pass-through). Returns model."""
     if type(model) in _SWAP:
         model.__class__ = _SWAP[type(model)]
         return model
     for _, child in list(model.named_children()):
-        convert(child)
+        convert(child, fuse_relu)
+    if fuse_relu and isinstance(model, torch.nn.Sequential):
+        mods = list(model._modules.items())
+        for (_, a), (name, b) in zip(mods, mods[1:]):
+            if isinstance(a, _FUSABLE) and type(b) is torch.nn.ReLU and not a.fused_relu \
+                    and not a._forward_hooks and not b._forward_hooks and not b._forward_pre_hooks:
+                a.fused_relu = True
+                model._modules[name] = _FusedReLU()
     return model

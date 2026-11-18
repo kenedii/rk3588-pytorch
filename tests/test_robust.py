@@ -66,18 +66,18 @@ x, y = torch.randn(64, 128), torch.randn(128, 96)
 ref = x.double() @ y.double()
 
 ops.reset_verification()
-ops._npu_gemm = lambda a, b, p: real(a, b, p) * 1.5          # silently wrong
+ops._npu_gemm = lambda a, b, p, *r: real(a, b, p, *r) * 1.5         # silently wrong
 out = ops.gemm(x, y)
 check("wrong NPU result caught by first-use check", rel(out, ref) < 1e-6)
 check("...and that shape is pinned to the CPU", ops._verified.get(next(iter(ops._verified))) is False)
 
 ops.reset_verification()
-ops._npu_gemm = lambda a, b, p: torch.full((a.shape[0], b.shape[1]), float("nan"))
+ops._npu_gemm = lambda a, b, p, *r: torch.full((a.shape[0], b.shape[1]), float("nan"))
 out = ops.gemm(x, y)
 check("NaN NPU output recomputed on the CPU", torch.isfinite(out).all().item() and rel(out, ref) < 1e-6)
 
 ops.reset_verification()
-def boom(a, b, p):
+def boom(a, b, p, *r):
     raise RuntimeError("simulated NPU timeout")
 ops._npu_gemm = boom
 fails0 = ops._failures

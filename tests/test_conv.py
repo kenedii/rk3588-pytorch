@@ -58,7 +58,7 @@ for c in [(2, 16, 14, 14, 32, 3, 1, 1), (1, 3, 64, 64, 16, 7, 2, 3)]:
 for (N, C, H, W, O, k, s, p) in [(2, 16, 12, 12, 32, 3, 1, 1), (2, 8, 15, 15, 16, 3, 2, 1), (1, 3, 32, 32, 16, 5, 2, 2)]:
     x = torch.randn(N, C, H, W, requires_grad=True)
     w = torch.randn(O, C, k, k, requires_grad=True)
-    y = torch.ops.rknpu.conv2d(x, w, [s, s], [p, p], "fp16")
+    y = torch.ops.rknpu.conv2d(x, w, None, [s, s], [p, p], 1, "none", "fp16")
     g = torch.randn_like(y)
     y.backward(g)
     xd, wd = x.detach().double().requires_grad_(), w.detach().double().requires_grad_()

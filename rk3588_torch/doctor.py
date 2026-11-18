@@ -170,6 +170,15 @@ def run():
               "" if err < 5e-3 else "convolutions will run on the CPU (npu_mode(conv=False) to skip them)")
     except Exception as e:  # noqa: BLE001
         _line("fail", "self-test conv2d", repr(e))
+    try:
+        x, w, b = torch.randn(2, 64, 12, 12), torch.randn(64, 16, 3, 3), torch.randn(64)
+        oc = ops._npu_conv(x, w, (1, 1), (1, 1), "fp16", groups=4, bias=b, relu=True)
+        rc = torch.relu(torch.nn.functional.conv2d(x.double(), w.double(), b.double(), padding=1, groups=4))
+        err = ((oc.double() - rc).norm() / rc.norm()).item()
+        _line("ok" if err < 5e-3 else "fail", "self-test grouped conv + bias + ReLU", f"rel err {err:.1e}",
+              "" if err < 5e-3 else "grouped convolutions / fused epilogues are unreliable here")
+    except Exception as e:  # noqa: BLE001
+        _line("fail", "self-test grouped conv + bias + ReLU", repr(e))
 
     # --- calibration ---
     from .calibrate import cached_threshold, NEVER

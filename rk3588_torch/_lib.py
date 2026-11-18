@@ -27,6 +27,7 @@ class RkStats(ctypes.Structure):
         ("k_tile", ctypes.c_int),
         ("n_tile", ctypes.c_int),
         ("sync_us", ctypes.c_double),
+        ("cache_hits", ctypes.c_int),
     ]
 
     def as_dict(self):
@@ -87,6 +88,17 @@ def _load():
     lib.rk_set_max_buf_mb.argtypes = [vp, i]
     lib.rk_conv2d.argtypes = [vp, i, i, i, i, i, fp, i, i, i, fp, i, i, i, i, i, i, fp, i]
     lib.rk_conv2d.restype = i
+    lib.rk_conv2d_grouped.argtypes = [vp, i, i, i, i, i, fp, i, i, i, fp, i, i, i, i, i, i, fp, i, i]
+    lib.rk_conv2d_grouped.restype = i
+    lib.rk_set_epilogue.argtypes = [vp, fp, i]
+    lib.rk_set_wcache_key.argtypes = [vp, ctypes.c_uint64]
+    lib.rk_wcache_drop.argtypes = [vp, ctypes.c_uint64]
+    lib.rk_wcache_clear.argtypes = [vp]
+    lib.rk_wcache_bytes.argtypes = [vp]
+    lib.rk_wcache_bytes.restype = ctypes.c_size_t
+    lib.rk_wcache_entries.argtypes = [vp]
+    lib.rk_wcache_entries.restype = i
+    lib.rk_set_wcache_mb.argtypes = [vp, i]
     lib.rk_buffer_bytes.argtypes = [vp]
     lib.rk_buffer_bytes.restype = ctypes.c_size_t
     lib.rk_query.argtypes = [vp, ctypes.POINTER(RkInfo)]
@@ -125,23 +137,49 @@ class NPU:
     def set_max_m_tile(self, m):
         self.lib.rk_set_max_m_tile(self.ctx, int(m))
 
-    def gemm(self, batch, M, N, K, a_ptr, sa_b, sa_m, sa_k, b_ptr, sb_b, sb_k, sb_n, c_ptr, sc_b, ldc,
-             accumulate=False, precision="fp16"):
-        code = PRECISIONS[precision]
+    def _call(self, fn, args, bias_ptr, relu, wkey):
         with self.lock:
-            r = self.lib.rk_gemm_batched(self.ctx, code, batch, M, N, K, a_ptr, sa_b, sa_m, sa_k,
-                                         b_ptr, sb_b, sb_k, sb_n, c_ptr, sc_b, ldc, 1 if accumulate else 0)
+            if bias_ptr or relu:
+                self.lib.rk_set_epilogue(self.ctx, bias_ptr or None, 1 if relu else 0)
+            if wkey:
+                self.lib.rk_set_wcache_key(self.ctx, wkey)
+            try:
+                r = fn(self.ctx, *args)
+            finally:
+                if bias_ptr or relu:
+                    self.lib.rk_set_epilogue(self.ctx, None, 0)
+                if wkey:
+                    self.lib.rk_set_wcache_key(self.ctx, 0)
             if r != 0:
-                raise RuntimeError("rknpu gemm failed: " + self.lib.rk_last_error(self.ctx).decode())
+                raise RuntimeError(f"rknpu {fn.__name__[3:]} failed: " + self.lib.rk_last_error(self.ctx).decode())
+
+    def gemm(self, batch, M, N, K, a_ptr, sa_b, sa_m, sa_k, b_ptr, sb_b, sb_k, sb_n, c_ptr, sc_b, ldc,
+             accumulate=False, precision="fp16", bias_ptr=0, relu=False, wkey=0):
+        """C = A @ B (+ bias[n]) (ReLU); wkey != 0 caches B's packed form under that key."""
+        self._call(self.lib.rk_gemm_batched, (PRECISIONS[precision], batch, M, N, K, a_ptr, sa_b, sa_m, sa_k,
+                                              b_ptr, sb_b, sb_k, sb_n, c_ptr, sc_b, ldc, 1 if accumulate else 0),
+                   bias_ptr, relu, wkey)
 
     def conv2d(self, N, C, H, W, x_ptr, O, kh, kw, w_ptr, sy, sx, pt, pl, oh, ow, y_ptr,
-               accumulate=False, precision="fp16"):
+               accumulate=False, precision="fp16", groups=1, bias_ptr=0, relu=False, wkey=0):
         code = PRECISIONS["bf16" if precision == "bf16" else "fp16"]
+        self._call(self.lib.rk_conv2d_grouped, (code, N, C, H, W, x_ptr, O, kh, kw, w_ptr, sy, sx, pt, pl, oh, ow,
+                                                y_ptr, 1 if accumulate else 0, groups), bias_ptr, relu, wkey)
+
+    def wcache_drop(self, key):
         with self.lock:
-            r = self.lib.rk_conv2d(self.ctx, code, N, C, H, W, x_ptr, O, kh, kw, w_ptr, sy, sx, pt, pl, oh, ow,
-                                   y_ptr, 1 if accumulate else 0)
-            if r != 0:
-                raise RuntimeError("rknpu conv2d failed: " + self.lib.rk_last_error(self.ctx).decode())
+            self.lib.rk_wcache_drop(self.ctx, key)
+
+    def wcache_clear(self):
+        with self.lock:
+            self.lib.rk_wcache_clear(self.ctx)
+
+    def wcache_info(self):
+        return {"bytes": int(self.lib.rk_wcache_bytes(self.ctx)), "entries": int(self.lib.rk_wcache_entries(self.ctx))}
+
+    def set_wcache_mb(self, mb):
+        with self.lock:
+            self.lib.rk_set_wcache_mb(self.ctx, int(mb))
 
     # backwards compatible single-GEMM entry point
     def gemm_ptr(self, M, N, K, a_ptr, sa_m, sa_k, b_ptr, sb_k, sb_n, c_ptr, ldc, accumulate=False,

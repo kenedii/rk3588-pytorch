@@ -41,7 +41,9 @@ optimizer.step()                       # everything else stays on the CPU
 | 🔌 **Drop-in** | no model conversion, no RKNN runtime, no changes to your model code |
 | 🎚️ **Five precisions** | fp16, bf16, int8, fp16-output, and an fp32-accurate split mode (~1e-7 error) |
 | 🧠 **All three NPU cores** | work is split across cores automatically |
-| 🧱 **Linear, conv, attention** | `nn.Linear`, native NPU `Conv2d`, `scaled_dot_product_attention`, `bmm`, `torch.compile` |
+| 🧱 **Linear, conv, attention** | `Linear`, native NPU `Conv1d`/`Conv2d`/`ConvTranspose2d` (incl. grouped), `einsum`, attention, `bmm`, `torch.compile` |
+| 🔗 **Fused bias + ReLU** | added while the NPU output is unpacked; a ReLU with no bias runs in the NPU's own DPU stage |
+| 🧊 **Weight cache** | frozen or unchanged weights (LoRA, eval, inference) are converted for the NPU once, not every call |
 | 🛟 **Can't make things worse** | NPU errors, wrong results and NaNs fall back to the CPU automatically; small ops stay on the CPU |
 | 🩺 **Tells you if it's worth it** | `doctor` checks your setup, `compare()` measures your model and recommends a precision |
 | 🔬 **Built from scratch** | writes the NPU's register command streams directly; reverse-engineering tools included |
@@ -106,8 +108,11 @@ with rk3588_torch.profile():
         model(x).sum().backward()
 ```
 
-Other entry points: `rk3588_torch.convert(model)` swaps `nn.Linear`/`nn.Conv2d` for NPU
-versions so the model uses the NPU without `npu_mode()` (and works with `torch.compile`);
+Other entry points: `rk3588_torch.convert(model)` swaps `nn.Linear`, `nn.Conv1d`,
+`nn.Conv2d` and `nn.ConvTranspose2d` for NPU versions so the model uses the NPU without
+`npu_mode()` (and works with `torch.compile`). Inside an `nn.Sequential` it also folds each
+`Linear`/`Conv` -> `ReLU` pair into one fused NPU call (state_dict keys don't change).
+`rk3588_torch.wcache.info()` shows the weight cache, and the CLI has
 `python -m rk3588_torch bench` and `python -m rk3588_torch calibrate`.
 
 ## Benchmarks
@@ -222,21 +227,29 @@ speed: its CPU-side splitting outweighs the NPU gain at these layer sizes.
 ## How it works
 
 ```
-PyTorch op (linear, matmul/mm/bmm/addmm/baddbmm, conv2d, scaled_dot_product_attention)
+PyTorch op (linear, matmul/mm/bmm/addmm/baddbmm, einsum, conv1d/conv2d/conv_transpose2d,
+   │  scaled_dot_product_attention)
    │  rk3588_torch.npu_mode() is a TorchFunctionMode that intercepts these ops
-   │  (or convert(model) swaps in NPULinear / NPUConv2d modules)
+   │  (or convert(model) swaps in NPU modules and fuses Linear/Conv -> ReLU)
+   │  einsum -> permute + one batched GEMM; conv1d -> conv2d of width 1;
+   │  conv_transpose2d -> one GEMM (kernel == stride) or a conv of the zero-dilated input
    ▼
-torch.library custom ops rknpu::mm / rknpu::conv2d, with autograd formulas:
+torch.library custom ops rknpu::mm / rknpu::linear / rknpu::conv2d, with autograd formulas:
    │  forward GEMM + dX = dY·W + dW = dYᵀ·X; conv dX as a convolution, dW as a GEMM
+   │  (one batched GEMM over the groups); ReLU masks the gradient with the saved output
    │  operands passed as (pointer, strides): transposes cost nothing
+   ▼
+weight cache: a weight seen twice unchanged (same storage, version counter and sampled
+   │  values) gets a cache key; the library then keeps its packed NPU copy
    ▼
 safety layer: below the calibrated size -> CPU; first use of each shape checked against
    │  a CPU sample; NPU errors / NaNs -> recompute on CPU; repeated failures -> CPU only
    ▼
 librknpu_gemm.so
-   │  A: fp32 → fp16 row-major      B: fp32 → fp16 16-kernel groups
+   │  A: fp32 → fp16 row-major      B: fp32 → fp16 16-kernel groups (or from the cache)
    │  tile M so each task's rows fit in CBUF; build 108-register task streams,
-   │  chain them through the NPU program counter, split across the 3 cores
+   │  chain them through the NPU program counter, split across the 3 cores;
+   │  bias + ReLU applied while unpacking the output (ReLU in the DPU when there's no bias)
    ▼
 RK3588 NPU: CNA (MACs) → CORE → DPU. Matmuls run as 1×1 convolutions on row-major
 data; real convolutions use the native NC1HWC2 layout with the hardware's kernel,
@@ -278,6 +291,13 @@ Things that had to be discovered to make this work on a current kernel/driver:
   register constants (precision codes, output converter, surface add, notch). Probing
   the unused precision code 3 with a layout-independent test (B = all ones, so every
   output is a row sum) revealed a working bf16 MAC path.
+* **ReLU in the DPU, and what didn't work.** Clearing the bypass bits of the DPU's BS
+  stage (`DPU_BS_CFG` = 0x12) applies a ReLU to the accumulator before it is written out;
+  it's used when no bias has to be added first. The hardware depthwise mode
+  (`CONV_MODE` 3 in CNA and DPU plus `CORE_MISC_CFG` `DW_EN`, as Mesa programs it for
+  int8) timed out with every fp16 weight layout tried (`tools/dw_probe.py`), so depthwise
+  convolutions stay on the CPU. Grouped convolutions run as one task chain with each
+  group's weights and input channels in their own blocks.
 * **`memset(0)` on uncached NPU memory faults.** glibc zeroes with `DC ZVA`, which is
   not allowed on Device memory (this is why the original mtx512 tests die with SIGBUS);
   the library uses cacheable buffers with explicit syncs instead.
@@ -289,20 +309,24 @@ Things that had to be discovered to make this work on a current kernel/driver:
 | `csrc/rknpu_gemm.c`, `rknpu_gemm.h` | NPU GEMM library: tiling, packing, register streams, submit |
 | `csrc/npu_regs.h` | Register offsets and command-word encoding |
 | `csrc/rknpu_uapi.h` | ioctl structs matching the rknpu 0.9.8 driver |
-| `rk3588_torch/ops.py` | guarded NPU ops, custom ops with autograd, conv, attention |
-| `rk3588_torch/mode.py` | `npu_mode()` op router, `convert()`, `NPULinear`, `NPUConv2d` |
+| `rk3588_torch/ops.py` | guarded NPU ops, custom ops with autograd, conv / conv1d / conv_transpose2d, einsum, attention |
+| `rk3588_torch/mode.py` | `npu_mode()` op router, `convert()` (with ReLU fusion), the `NPU*` modules |
+| `rk3588_torch/wcache.py` | packed-weight cache policy (when a weight counts as unchanged) |
 | `rk3588_torch/tools.py` | `compare()` and `profile()` |
 | `rk3588_torch/doctor.py`, `calibrate.py`, `__main__.py` | `python -m rk3588_torch doctor / calibrate / bench / info` |
 | `rk3588_torch/_lib.py` | ctypes binding to the C library |
 | `tests/test_ops.py` | GEMM / gradient correctness vs fp64 CPU references |
 | `tests/test_precision.py` | Accuracy and range of every precision mode |
 | `tests/test_conv.py` | Native convolution forward/backward over many geometries (`--bench` for timing) |
+| `tests/test_new_ops.py` | conv1d, conv_transpose2d, grouped conv, einsum, fusion, weight cache (`--fake` runs without an NPU) |
 | `tests/test_robust.py` | Fallbacks, verification, batching, attention, `convert()`, `torch.compile`, tools |
 | `bench/bench_gemm.py` | CPU vs NPU GEMM throughput |
 | `bench/bench_precision.py` | Speed and error of every precision mode |
 | `bench/bench_models.py` | MLP / CNN / ResNet / Transformer training steps, CPU vs NPU |
+| `bench/bench_new_ops.py` | fusion, weight cache (inference, LoRA), conv_transpose2d, grouped conv, conv1d, einsum |
 | `examples/train_mnist.py` | MLP / CNN training on NPU vs CPU |
 | `tools/conv_probe.py` | Probe native convolution layouts |
+| `tools/dw_probe.py` | Probe the depthwise mode and the DPU ReLU |
 | `tools/gemm_test.c` | C-level correctness + timing |
 | `tools/ioctl_spy.c` | `LD_PRELOAD` shim logging RKNPU ioctls and dumping command streams |
 | `tools/rknn_mm_test.c` | Reference matmul through Rockchip's `rknn_matmul` API |
@@ -326,6 +350,8 @@ experimenting:
 | `RKNPU_THREADS` | `3` | CPU threads used for packing data for the NPU (pinned to the big cores) |
 | `RKNPU_MODE` | `2` | `2` = all three NPU cores, `1` = one core, `0` = one task per submit (debugging) |
 | `RKNPU_MAX_BUF_MB` | `512` | cap on NPU buffer memory; bigger ops are split |
+| `RKNPU_WCACHE` | `1` | `0` turns off the packed-weight cache |
+| `RKNPU_WCACHE_MB` | `256` | NPU memory for cached weights (least recently used are evicted) |
 | `RKNPU_LOCK` | `1` | serialize NPU use across processes that use this library (`/tmp/rk3588_torch.lock`) |
 | `RKNPU_TIMEOUT_MS` | `3000` | per-job timeout before the driver resets the NPU |
 | `RKNPU_DEV` | auto | NPU device node (default: the DRM card named `rknpu`) |
@@ -341,7 +367,7 @@ In Python: `set_precision()`, `set_enabled()`, `release()` (free NPU buffers), `
 | Kernel driver | vendor `rknpu` 0.9.8 (Armbian 6.12, patched build) | other 0.9.x vendor builds (`doctor` reports the version) | mainline `rocket` driver (different uAPI) |
 | OS | Armbian 25.11 (Ubuntu 24.04) | any aarch64 Linux with the driver | |
 | PyTorch | 2.15 CPU wheel | 2.4 or newer | |
-| Ops on the NPU | `linear`, `matmul`/`mm`/`bmm`/`addmm`/`baddbmm`, `conv2d` (groups 1, dilation 1, zero padding), `scaled_dot_product_attention` | | grouped / depthwise / dilated conv, `conv1d`/`conv3d`, fused RNNs (all run on the CPU) |
+| Ops on the NPU | `linear`, `matmul`/`mm`/`bmm`/`addmm`/`baddbmm`, two-operand `einsum`, `conv1d`/`conv2d`/`conv_transpose2d` (incl. grouped; dilation 1, zero padding), `scaled_dot_product_attention` | | depthwise / dilated conv, `conv3d`, fused RNNs (all run on the CPU) |
 | Tensors | CPU `float32`, `float16`, `bfloat16` | | CUDA / other devices, integer tensors (left to PyTorch) |
 
 On a non-RK3588 machine the package still installs and everything runs on the CPU, which
@@ -382,7 +408,12 @@ steps differ slightly, like mixed-precision training on a GPU.
 registered as `torch.library` custom ops with fake (meta) implementations.
 
 **Can I use it for inference?** Yes, it's just faster matmuls and convolutions; use
-`torch.no_grad()` as usual. For maximum inference speed Rockchip's RKNN toolkit, which
+`torch.no_grad()` as usual. The weight cache keeps each layer's converted weights on the
+NPU after the second call, so repeated inference skips the weight conversion.
+
+**Does it help LoRA / fine-tuning with frozen layers?** Yes: frozen weights hit the weight
+cache, so each step only converts activations and the small trainable adapters. Ordinary
+training doesn't use the cache (weights change every step), and doesn't pay for it. For maximum inference speed Rockchip's RKNN toolkit, which
 compiles the whole graph, will usually be faster.
 
 **What if the NPU gets something wrong?** The first time a shape is seen, part of its
@@ -397,9 +428,13 @@ shape; `RKNPU_VERIFY=always` checks every call if you want to be certain.
   as experimental for training.
 * Only GEMM-shaped work runs on the NPU; elementwise ops, norms, softmax, pooling and
   the optimizer stay on the CPU, so small models gain less.
-* Convolutions: groups=1 (no depthwise), no dilation, zero padding only, `conv2d` only.
-  Everything else runs on the CPU. 7×7 stems on 3-channel images gain little (the NPU
-  works on 32-channel blocks).
+* Convolutions: no dilation, zero padding only, images at least 5 rows tall and at most
+  2047 wide/tall (conv1d sequences up to 2047). Grouped convolutions run on the NPU only
+  when each group has enough channels (the padding to 32 input / 16 output channels
+  wastes less than 8×); depthwise convolutions and `conv3d` run on the CPU. 7×7 stems on
+  3-channel images gain little (the NPU works on 32-channel blocks).
+* `einsum`: two operands, no `...` and no repeated indices within an operand; other forms
+  are left to PyTorch.
 * Each NPU call costs ~0.3 ms of CPU-side packing and submission, so many small ops
   (e.g. attention with small heads) stay on the CPU.
 * A job that hangs makes the driver soft-reset all NPU cores, which would also abort

@@ -1,7 +1,7 @@
 """rk3588_torch: use the Rockchip RK3588 NPU as a matmul accelerator for PyTorch training.
 
-GEMMs (forward and both backward products) run on the NPU; everything else stays on the
-CPU. Anything the NPU can't do, or does too slowly, falls back to the CPU automatically.
+GEMMs and convolutions (forward and both backward products) run on the NPU; everything
+else stays on the CPU. Anything the NPU can't do, or does too slowly, falls back to the CPU automatically.
 
     import rk3588_torch
     with rk3588_torch.npu_mode():
@@ -12,18 +12,21 @@ CPU. Anything the NPU can't do, or does too slowly, falls back to the CPU automa
     with rk3588_torch.profile(): ...        # where does the time go?
     python -m rk3588_torch doctor           # check the setup
 """
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from ._lib import NPU, PRECISIONS, default_npu, npu_available, npu_error
-from .mode import NPUConv2d, NPULinear, NPUMode, convert, disable, enable, npu_mode
-from .ops import (bmm, conv2d, get_precision, gemm, is_enabled, linear, matmul, mm_raw, release,
-                  reset_verification, scaled_dot_product_attention, set_enabled, set_precision, stats,
+from .mode import (NPUConv1d, NPUConv2d, NPUConvTranspose2d, NPULinear, NPUMode, convert, disable, enable,
+                   npu_mode)
+from . import wcache
+from .ops import (bmm, conv1d, conv2d, conv_transpose2d, einsum, get_precision, gemm, is_enabled, linear, matmul,
+                  mm_raw, release, reset_verification, scaled_dot_product_attention, set_enabled, set_precision, stats,
                   threshold)
 from .tools import compare, profile
 from .calibrate import calibrate
 
 __all__ = ["NPU", "PRECISIONS", "default_npu", "npu_available", "npu_error",
-           "NPUConv2d", "NPULinear", "NPUMode", "convert", "disable", "enable", "npu_mode",
-           "bmm", "conv2d", "get_precision", "gemm", "is_enabled", "linear", "matmul", "mm_raw", "release",
+           "NPUConv1d", "NPUConv2d", "NPUConvTranspose2d", "NPULinear", "NPUMode", "convert", "disable", "enable",
+           "npu_mode", "bmm", "conv1d", "conv2d", "conv_transpose2d", "einsum", "wcache", "get_precision", "gemm",
+           "is_enabled", "linear", "matmul", "mm_raw", "release",
            "reset_verification", "scaled_dot_product_attention", "set_enabled", "set_precision", "stats",
            "threshold", "compare", "profile", "calibrate", "__version__"]

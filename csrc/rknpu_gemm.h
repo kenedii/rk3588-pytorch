@@ -27,6 +27,7 @@ typedef struct {
 	int    submits;     /* submit ioctls in the last call */
 	int    m_tile, k_tile, n_tile;
 	double sync_us;     /* CPU cache maintenance (MEM_SYNC ioctls) */
+	int    cache_hits;  /* weight operands taken from the packed-weight cache */
 } rk_stats;
 
 /* Opens the NPU DRM node (NULL = auto-detect the "rknpu" card). Returns NULL on failure. */
@@ -97,16 +98,40 @@ int rk_probe_raw(rk_ctx *ctx, const rk_probe_cfg *cfg, int M, int N, int K,
 
 /* 2-D convolution on the NPU (fp32 NCHW in/out; prec RK_PREC_FP16 or RK_PREC_BF16).
  * x: (N, C, H, W), w: (O, C, kh, kw), y: (N, O, oh, ow); padding top/left = pt/pl, bottom/right
- * implied by oh/ow. Groups and dilation are not supported. */
+ * implied by oh/ow. Dilation is not supported (see rk_conv2d_grouped for groups). */
 int rk_conv2d(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float *x,
               int O, int kh, int kw, const float *w, int sy, int sx, int pt, int pl,
               int oh, int ow, float *y, int accumulate);
+
+/* Grouped convolution: w is (O, C/groups, kh, kw); groups must divide C and O. */
+int rk_conv2d_grouped(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float *x,
+                      int O, int kh, int kw, const float *w, int sy, int sx, int pt, int pl,
+                      int oh, int ow, float *y, int accumulate, int groups);
+
+/* Output epilogue for the following GEMM / convolution calls (sticky until changed):
+ * y = relu?(y + bias), bias indexed by output column (GEMM) or output channel (conv);
+ * bias = NULL for none. The ReLU runs in the NPU's DPU when nothing is added afterwards. */
+void rk_set_epilogue(rk_ctx *ctx, const float *bias, int relu);
+
+/* Packed-weight cache. While a nonzero key is set, the weight operand (GEMM B, conv
+ * weights) of the following calls is packed once into a dedicated NPU buffer under that key
+ * and reused by later calls with the same key, precision and shape. The caller guarantees
+ * that a key always names the same weight values (change the key when they change).
+ * LRU-evicted beyond RKNPU_WCACHE_MB (default 256; 0 disables). */
+void   rk_set_wcache_key(rk_ctx *ctx, uint64_t key);
+void   rk_wcache_drop(rk_ctx *ctx, uint64_t key);
+void   rk_wcache_clear(rk_ctx *ctx);
+size_t rk_wcache_bytes(rk_ctx *ctx);
+int    rk_wcache_entries(rk_ctx *ctx);
+void   rk_set_wcache_mb(rk_ctx *ctx, int mb);
 
 /* Raw single-task convolution (fp16 NHWC in, fp32 NHWC out) for probing. */
 typedef struct {
 	int h, w, c, n, kh, kw, sy, sx, pt, pl, oh, ow;
 	int grains, dbanks;     /* 0 = defaults */
 	int layout;             /* 0 = row-major (NHWC) attempt, 1 = NC1HWC2 */
+	int dw;                 /* depthwise (w_bytes = one kernel per channel) */
+	int relu;               /* DPU ReLU */
 } rk_conv_cfg;
 int rk_conv_raw(rk_ctx *ctx, const rk_conv_cfg *cfg, const void *in_nhwc, const void *w_bytes, void *out_nhwc);
 
