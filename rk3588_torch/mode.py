@@ -4,8 +4,10 @@
         loss = model(x).sum()
         loss.backward()
 
-Inside the context, F.linear / matmul / mm / bmm / addmm / conv2d on CPU float tensors
-run their GEMMs (forward and backward) on the NPU; every other op stays on the CPU.
+Inside the context, F.linear / matmul / mm / bmm / addmm on CPU float tensors run their
+GEMMs (forward and backward) on the NPU; every other op stays on the CPU. conv2d can be
+routed too (im2col + NPU GEMM) with npu_mode(conv=True), but for small CNNs PyTorch's
+native CPU convolution is usually faster than the unfold round trip.
 """
 import torch
 import torch.nn.functional as F
@@ -27,7 +29,7 @@ def _big_enough(m, n, k):
 
 
 class NPUMode(TorchFunctionMode):
-    def __init__(self, linear=True, matmul=True, conv=True):
+    def __init__(self, linear=True, matmul=True, conv=False):
         super().__init__()
         self.linear = linear
         self.matmul = matmul

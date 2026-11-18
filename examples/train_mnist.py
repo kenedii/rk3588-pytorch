@@ -61,6 +61,9 @@ def load_mnist():
 
 
 def make_model(kind):
+    if kind == "mlp-wide":
+        return nn.Sequential(nn.Flatten(), nn.Linear(784, 2048), nn.ReLU(), nn.Linear(2048, 2048), nn.ReLU(),
+                             nn.Linear(2048, 1024), nn.ReLU(), nn.Linear(1024, 10))
     if kind == "mlp":
         return nn.Sequential(nn.Flatten(), nn.Linear(784, 512), nn.ReLU(), nn.Linear(512, 256), nn.ReLU(),
                              nn.Linear(256, 10))
@@ -84,6 +87,10 @@ def accuracy(model, x, y, use_npu):
     return correct / len(x)
 
 
+def npu_ctx(args):
+    return rt.npu_mode(conv=getattr(args, "conv", False))
+
+
 def train(model, data, args, use_npu):
     opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
     g = torch.Generator().manual_seed(1)
@@ -94,7 +101,7 @@ def train(model, data, args, use_npu):
         x, y = data["train_x"][idx], data["train_y"][idx]
         t0 = time.perf_counter()
         if use_npu:
-            with rt.npu_mode():
+            with npu_ctx(args):
                 loss = F.cross_entropy(model(x), y)
                 opt.zero_grad()
                 loss.backward()
@@ -113,13 +120,14 @@ def train(model, data, args, use_npu):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", choices=["mlp", "cnn"], default="mlp")
+    p.add_argument("--model", choices=["mlp", "mlp-wide", "cnn"], default="mlp")
     p.add_argument("--steps", type=int, default=300)
     p.add_argument("--batch", type=int, default=128)
     p.add_argument("--lr", type=float, default=0.05)
     p.add_argument("--threads", type=int, default=3)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--only", choices=["npu", "cpu", "both"], default="both")
+    p.add_argument("--conv", action="store_true", help="also route conv2d to the NPU (im2col)")
     args = p.parse_args()
     torch.set_num_threads(args.threads)
     torch.manual_seed(0)
@@ -131,7 +139,8 @@ def main():
           f"batch={args.batch}, steps={args.steps}, cpu threads={args.threads}")
 
     results = {}
-    for mode in (["npu", "cpu"] if args.only == "both" else [args.only]):
+    # CPU first: once the NPU library has started its worker threads, they share the cores
+    for mode in (["cpu", "npu"] if args.only == "both" else [args.only]):
         model = copy.deepcopy(base)
         use_npu = mode == "npu"
         rt.stats(reset=True)

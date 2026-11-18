@@ -54,7 +54,7 @@ check("linear dbias", bias.grad, bd.grad)
 def grads(model, inp, use_npu):
     model.zero_grad()
     if use_npu:
-        with rt.npu_mode():
+        with rt.npu_mode(conv=True):
             out = model(inp)
     else:
         out = model(inp)

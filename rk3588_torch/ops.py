@@ -11,7 +11,7 @@ from ._lib import default_npu
 
 # Below this many multiply-adds the CPU wins (submit + packing overhead dominates).
 # Overridable with RKNPU_MIN_MACS; tuned from bench/bench_gemm.py on a Rock 5B.
-MIN_MACS = int(os.environ.get("RKNPU_MIN_MACS", str(64 * 64 * 64)))
+MIN_MACS = int(os.environ.get("RKNPU_MIN_MACS", str(8_000_000)))
 
 _stats = {"npu_calls": 0, "cpu_calls": 0, "npu_macs": 0, "cpu_macs": 0}
 

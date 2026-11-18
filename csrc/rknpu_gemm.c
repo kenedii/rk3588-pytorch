@@ -29,10 +29,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <drm/drm.h>
+#include <pthread.h>
 #include <sched.h>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 #include "npu_regs.h"
 #include "rknpu_gemm.h"
@@ -46,6 +44,8 @@
 #define CBUF_WEIGHT_REUSE (1u << 13)
 
 typedef _Float16 f16;
+struct pool;
+static void pool_destroy(struct pool *p);
 
 typedef struct {
 	uint32_t handle;
@@ -65,7 +65,7 @@ struct rk_ctx {
 	int      max_n;
 	int      timeout_ms;
 	int      reuse;
-	int      pinned;
+	struct pool *pool;
 	rk_buf   regcmd, tasks, a, b, c;
 	rk_stats stats;
 	char     err[256];
@@ -125,7 +125,7 @@ rk_ctx *rk_open(const char *dev) {
 	ctx->max_n = env_int("RKNPU_MAX_N", 4096);
 	ctx->timeout_ms = env_int("RKNPU_TIMEOUT_MS", 3000);
 	ctx->reuse = env_int("RKNPU_WEIGHT_REUSE", 1);
-	ctx->pinned = 0;
+
 	return ctx;
 }
 
@@ -145,6 +145,7 @@ void rk_close(rk_ctx *ctx) {
 	buf_free(ctx, &ctx->a);
 	buf_free(ctx, &ctx->b);
 	buf_free(ctx, &ctx->c);
+	pool_destroy(ctx->pool);
 	close(ctx->fd);
 	free(ctx);
 }
@@ -353,14 +354,73 @@ static int submit(rk_ctx *ctx, int start, int count, int cores) {
 }
 
 /*
- * Pin the packing threads to the big cores. On RK3588 an unpinned OpenMP pool often
- * lands on the Cortex-A55 cluster, which made packing ~10x slower in measurements.
- * Big cores are the ones with the highest cpu_capacity (cpu4-7 on RK3588).
+ * Worker pool for packing/unpacking. Workers are pinned to the big cores: an unpinned
+ * pool often lands on the Cortex-A55 cluster, which made packing ~10x slower. Workers
+ * sleep on a condition variable between jobs (no spinning, so they don't steal cycles
+ * from PyTorch's own threads), work is handed out dynamically so the calling thread can
+ * help wherever the scheduler put it, and the caller's affinity is never changed.
  */
-static void pin_threads(rk_ctx *ctx) {
-	if (ctx->pinned || env_int("RKNPU_NO_PIN", 0)) return;
-	ctx->pinned = 1;
-	int caps[64], ncpu = 0, maxcap = 0;
+typedef void (*range_fn)(void *arg, int begin, int end);
+
+struct pool {
+	int nworkers;
+	pthread_t th[16];
+	int cpu[16];
+	pthread_mutex_t mu;
+	pthread_cond_t start_cv, done_cv;
+	unsigned gen;
+	int active;          /* workers still inside the current job */
+	int quit;
+	range_fn fn;
+	void *arg;
+	int total, grain;
+	int next;            /* next unclaimed item (atomic) */
+};
+
+typedef struct { struct pool *p; int idx; } worker_arg;
+
+static void pool_drain(struct pool *p) {
+	for (;;) {
+		int b = __atomic_fetch_add(&p->next, p->grain, __ATOMIC_RELAXED);
+		if (b >= p->total) break;
+		int e = b + p->grain < p->total ? b + p->grain : p->total;
+		p->fn(p->arg, b, e);
+	}
+}
+
+static void *worker_main(void *v) {
+	worker_arg *wa = v;
+	struct pool *p = wa->p;
+	if (p->cpu[wa->idx] >= 0) {
+		cpu_set_t set;
+		CPU_ZERO(&set);
+		CPU_SET(p->cpu[wa->idx], &set);
+		sched_setaffinity(0, sizeof(set), &set);
+	}
+	free(wa);
+	unsigned seen = 0;
+	pthread_mutex_lock(&p->mu);
+	for (;;) {
+		while (p->gen == seen && !p->quit) pthread_cond_wait(&p->start_cv, &p->mu);
+		if (p->quit) break;
+		seen = p->gen;
+		pthread_mutex_unlock(&p->mu);
+		pool_drain(p);
+		pthread_mutex_lock(&p->mu);
+		if (--p->active == 0) pthread_cond_signal(&p->done_cv);
+	}
+	pthread_mutex_unlock(&p->mu);
+	return NULL;
+}
+
+static struct pool *pool_create(int nworkers) {
+	struct pool *p = calloc(1, sizeof(*p));
+	if (nworkers > 16) nworkers = 16;
+	pthread_mutex_init(&p->mu, NULL);
+	pthread_cond_init(&p->start_cv, NULL);
+	pthread_cond_init(&p->done_cv, NULL);
+	/* big cores = highest cpu_capacity; leave the first one to the caller / PyTorch */
+	int caps[64], ncpu = 0, maxcap = 0, big[64], nbig = 0;
 	for (int c = 0; c < 64; c++) {
 		char path[96];
 		snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpu_capacity", c);
@@ -371,20 +431,51 @@ static void pin_threads(rk_ctx *ctx) {
 		if (caps[c] > maxcap) maxcap = caps[c];
 		ncpu = c + 1;
 	}
-	int big[64], nbig = 0;
 	for (int c = 0; c < ncpu; c++) if (caps[c] == maxcap) big[nbig++] = c;
-	if (nbig == 0 || nbig == ncpu) return;
-	/* skip the first big core: leave it to the calling (Python) thread */
-	int first = nbig > ctx->threads ? nbig - ctx->threads : 0;
-#ifdef _OPENMP
-	#pragma omp parallel num_threads(ctx->threads)
-	{
-		cpu_set_t set;
-		CPU_ZERO(&set);
-		CPU_SET(big[first + omp_get_thread_num() % (nbig - first)], &set);
-		sched_setaffinity(0, sizeof(set), &set);
+	int pin = !env_int("RKNPU_NO_PIN", 0) && nbig > 0 && nbig < ncpu;
+	int first = nbig > nworkers ? nbig - nworkers : 0;
+	p->nworkers = nworkers;
+	for (int i = 0; i < nworkers; i++) {
+		p->cpu[i] = pin ? big[first + i % (nbig - first)] : -1;
+		worker_arg *wa = malloc(sizeof(*wa));
+		wa->p = p;
+		wa->idx = i;
+		pthread_create(&p->th[i], NULL, worker_main, wa);
 	}
-#endif
+	return p;
+}
+
+static void pool_destroy(struct pool *p) {
+	if (!p) return;
+	pthread_mutex_lock(&p->mu);
+	p->quit = 1;
+	pthread_cond_broadcast(&p->start_cv);
+	pthread_mutex_unlock(&p->mu);
+	for (int i = 0; i < p->nworkers; i++) pthread_join(p->th[i], NULL);
+	free(p);
+}
+
+/* Run fn over [0, total) in chunks of `grain` on the workers plus the calling thread. */
+static void parallel_for(rk_ctx *ctx, int total, int grain, range_fn fn, void *arg) {
+	if (total <= 0) return;
+	if (grain < 1) grain = 1;
+	if (ctx->threads <= 1 || total <= grain) { fn(arg, 0, total); return; }
+	if (!ctx->pool) ctx->pool = pool_create(ctx->threads);
+	struct pool *p = ctx->pool;
+	pthread_mutex_lock(&p->mu);
+	p->fn = fn;
+	p->arg = arg;
+	p->total = total;
+	p->grain = grain;
+	p->next = 0;
+	p->active = p->nworkers;
+	p->gen++;
+	pthread_cond_broadcast(&p->start_cv);
+	pthread_mutex_unlock(&p->mu);
+	pool_drain(p);
+	pthread_mutex_lock(&p->mu);
+	while (p->active > 0) pthread_cond_wait(&p->done_cv, &p->mu);
+	pthread_mutex_unlock(&p->mu);
 }
 
 static inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
@@ -421,13 +512,100 @@ static void pack_a_blocked(f16 *dst, const float *A, int64_t sa_k, int M, int K,
 	}
 }
 
+typedef struct {
+	const float *A, *B;
+	int64_t sa_m, sa_k, sb_k, sb_n;
+	int M, N, K, Mp, Kc, Nc, nk, nn, nblk;
+	f16 *ap, *bp;
+	float *cp;
+	size_t a_chunk, b_tile, c_tile;
+	float *C;
+	int64_t ldc;
+	int accumulate;
+} pack_job;
+
+/* A: fp32 -> fp16, row-major [Mp][Kc] per K chunk; items are (K chunk, 16-row block) */
+static void pack_a_range(void *v, int b, int e) {
+	pack_job *J = v;
+	for (int it = b; it < e; it++) {
+		int j = it / J->nblk, bk = it % J->nblk;
+		int r0 = bk * 16, r1 = r0 + 16 < J->Mp ? r0 + 16 : J->Mp;
+		if (J->sa_k == 1 || J->sa_m != 1)
+			pack_a_rows(J->ap + j * J->a_chunk, J->A, J->sa_m, J->sa_k, J->M, J->K, r0, r1, j * J->Kc, J->Kc);
+		else
+			pack_a_blocked(J->ap + j * J->a_chunk, J->A, J->sa_k, J->M, J->K, r0, r1, j * J->Kc, J->Kc);
+	}
+}
+
+/* B: kernel groups [Nc/16][Kc/32][16][32] per (K chunk, N chunk); items are 16-kernel groups */
+static void pack_b_range(void *v, int b, int e) {
+	pack_job *J = v;
+	const int Kc = J->Kc, Nc = J->Nc, K = J->K, N = J->N;
+	const float *B = J->B;
+	const int64_t sb_k = J->sb_k, sb_n = J->sb_n;
+	for (int it = b; it < e; it++) {
+		int jc = it / (Nc / 16), ng = it % (Nc / 16);
+		int j = jc / J->nn, c = jc % J->nn;
+		f16 *dst = J->bp + (size_t)jc * J->b_tile + (size_t)ng * 16 * Kc;
+		if (sb_n == 1 && sb_k != 1) {
+			/* B row-major (k, n): read 16 consecutive n per k */
+			for (int cb = 0; cb < Kc / 32; cb++)
+				for (int kr = 0; kr < 32; kr++) {
+					int gk = j * Kc + cb * 32 + kr;
+					const float *s = B + (int64_t)gk * sb_k + (int64_t)(c * Nc + ng * 16);
+					for (int nr = 0; nr < 16; nr++) {
+						int gn = c * Nc + ng * 16 + nr;
+						dst[cb * 512 + nr * 32 + kr] = (gk < K && gn < N) ? (f16)s[nr] : (f16)0;
+					}
+				}
+		} else {
+			for (int cb = 0; cb < Kc / 32; cb++) {
+				for (int nr = 0; nr < 16; nr++) {
+					int gn = c * Nc + ng * 16 + nr;
+					f16 *d = dst + cb * 512 + nr * 32;
+					int k0 = j * Kc + cb * 32;
+					if (gn < N && k0 + 32 <= K) {
+						const float *s = B + (int64_t)k0 * sb_k + (int64_t)gn * sb_n;
+						if (sb_k == 1) { for (int t = 0; t < 32; t++) d[t] = (f16)s[t]; }
+						else { for (int t = 0; t < 32; t++) d[t] = (f16)s[(int64_t)t * sb_k]; }
+					} else {
+						for (int t = 0; t < 32; t++) {
+							int gk = k0 + t;
+							d[t] = (gn < N && gk < K) ? (f16)B[(int64_t)gk * sb_k + (int64_t)gn * sb_n] : (f16)0;
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+/* C: copy (and reduce over K chunks) rows of the row-major [Mp][Nc] output tiles */
+static void unpack_range(void *v, int b, int e) {
+	pack_job *J = v;
+	for (int m = b; m < e; m++) {
+		float *crow = J->C + (int64_t)m * J->ldc;
+		for (int c = 0; c < J->nn; c++) {
+			int n0 = c * J->Nc;
+			int ncols = J->N - n0 < J->Nc ? J->N - n0 : J->Nc;
+			const float *src = J->cp + (size_t)c * J->c_tile + (size_t)m * J->Nc;
+			if (J->nk == 1 && !J->accumulate) { memcpy(crow + n0, src, (size_t)ncols * 4); continue; }
+			for (int n = 0; n < ncols; n++) {
+				float acc = 0.f;
+				for (int j = 0; j < J->nk; j++)
+					acc += J->cp[(size_t)(j * J->nn + c) * J->c_tile + (size_t)m * J->Nc + n];
+				if (J->accumulate) crow[n0 + n] += acc; else crow[n0 + n] = acc;
+			}
+		}
+	}
+}
+
 int rk_gemm_f32(rk_ctx *ctx, int M, int N, int K,
                 const float *A, int64_t sa_m, int64_t sa_k,
                 const float *B, int64_t sb_k, int64_t sb_n,
                 float *C, int64_t ldc, int accumulate) {
 	double t_start = now_us();
 	memset(&ctx->stats, 0, sizeof(ctx->stats));
-	pin_threads(ctx);
 	if (M <= 0 || N <= 0 || K <= 0) { set_err(ctx, "bad shape"); return -1; }
 
 	/* ---- tiling plan ---- */
@@ -438,7 +616,13 @@ int rk_gemm_f32(rk_ctx *ctx, int M, int N, int K,
 	int nn = ceil_div(Np, ctx->max_n);
 	int Nc = round_up(ceil_div(Np, nn), 16);
 	int Mp = round_up(M, 4);
-	int wbanks_min = ceil_div(16 * Kc * 2, CBUF_BANK_SIZE);      /* one 16-kernel group */
+	/* weight banks: at least one 16-kernel group, and (like librknnrt) up to 4 banks or
+	 * whatever holds all weights; leaving a single bank for streamed weights hangs the CNA */
+	int wbanks_min = ceil_div(16 * Kc * 2, CBUF_BANK_SIZE);
+	int wall = ceil_div(Kc * 2 * Nc, CBUF_BANK_SIZE);
+	int wfloor = env_int("RKNPU_MIN_WBANKS", 4);
+	if (wall < wfloor) wfloor = wall;
+	if (wbanks_min < wfloor) wbanks_min = wfloor;
 	int dbanks_max = CBUF_BANKS - wbanks_min;
 	if (dbanks_max < 1) { set_err(ctx, "K chunk %d too large for CBUF", Kc); return -1; }
 	/* rows per task: (rows + 1) must fit in the data banks so the CNA can preload rows + 1 */
@@ -469,62 +653,16 @@ int rk_gemm_f32(rk_ctx *ctx, int M, int N, int K,
 	    buf_ensure(ctx, &ctx->tasks, (size_t)T * sizeof(struct rknpu_task), dflags | RKNPU_MEM_KERNEL_MAPPING))
 		return -1;
 
-	f16 *ap = ctx->a.ptr, *bp = ctx->b.ptr;
-	float *cp = ctx->c.ptr;
-	int nthr = ctx->threads;
-
-	/* ---- A: fp32 -> fp16, row-major [Mp][Kc] per K chunk ---- */
+	pack_job job = {
+		.A = A, .B = B, .sa_m = sa_m, .sa_k = sa_k, .sb_k = sb_k, .sb_n = sb_n,
+		.M = M, .N = N, .K = K, .Mp = Mp, .Kc = Kc, .Nc = Nc, .nk = nk, .nn = nn,
+		.ap = ctx->a.ptr, .bp = ctx->b.ptr, .cp = ctx->c.ptr, .a_chunk = a_chunk, .b_tile = b_tile,
+		.c_tile = c_tile, .C = C, .ldc = ldc, .accumulate = accumulate,
+	};
+	job.nblk = ceil_div(Mp, 16);
 	double t0 = now_us();
-	int rows_per = 16;
-	int nblk = ceil_div(Mp, rows_per);
-	#pragma omp parallel for collapse(2) schedule(static) num_threads(nthr)
-	for (int j = 0; j < nk; j++) {
-		for (int bk = 0; bk < nblk; bk++) {
-			int r0 = bk * rows_per, r1 = r0 + rows_per < Mp ? r0 + rows_per : Mp;
-			if (sa_k == 1 || sa_m != 1)
-				pack_a_rows(ap + j * a_chunk, A, sa_m, sa_k, M, K, r0, r1, j * Kc, Kc);
-			else
-				pack_a_blocked(ap + j * a_chunk, A, sa_k, M, K, r0, r1, j * Kc, Kc);
-		}
-	}
-	/* ---- B: kernel groups [Nc/16][Kc/32][16][32] per (K chunk, N chunk) ---- */
-	#pragma omp parallel for collapse(2) schedule(static) num_threads(nthr)
-	for (int jc = 0; jc < nk * nn; jc++) {
-		for (int ng = 0; ng < Nc / 16; ng++) {
-			int j = jc / nn, c = jc % nn;
-			f16 *dst = bp + (size_t)jc * b_tile + (size_t)ng * 16 * Kc;
-			if (sb_n == 1 && sb_k != 1) {
-				/* B row-major (k, n): read 16 consecutive n per k */
-				for (int cb = 0; cb < Kc / 32; cb++)
-					for (int kr = 0; kr < 32; kr++) {
-						int gk = j * Kc + cb * 32 + kr;
-						const float *s = B + (int64_t)gk * sb_k + (int64_t)(c * Nc + ng * 16);
-						for (int nr = 0; nr < 16; nr++) {
-							int gn = c * Nc + ng * 16 + nr;
-							dst[cb * 512 + nr * 32 + kr] = (gk < K && gn < N) ? (f16)s[nr] : (f16)0;
-						}
-					}
-			} else {
-				for (int cb = 0; cb < Kc / 32; cb++) {
-					for (int nr = 0; nr < 16; nr++) {
-						int gn = c * Nc + ng * 16 + nr;
-						f16 *d = dst + cb * 512 + nr * 32;
-						int k0 = j * Kc + cb * 32;
-						if (gn < N && k0 + 32 <= K) {
-							const float *s = B + (int64_t)k0 * sb_k + (int64_t)gn * sb_n;
-							if (sb_k == 1) { for (int t = 0; t < 32; t++) d[t] = (f16)s[t]; }
-							else { for (int t = 0; t < 32; t++) d[t] = (f16)s[(int64_t)t * sb_k]; }
-						} else {
-							for (int t = 0; t < 32; t++) {
-								int gk = k0 + t;
-								d[t] = (gn < N && gk < K) ? (f16)B[(int64_t)gk * sb_k + (int64_t)gn * sb_n] : (f16)0;
-							}
-						}
-					}
-				}
-			}
-		}
-	}
+	parallel_for(ctx, nk * job.nblk, 4, pack_a_range, &job);
+	parallel_for(ctx, nk * nn * (Nc / 16), 1, pack_b_range, &job);
 	ctx->stats.pack_us = now_us() - t0;
 	buf_sync(ctx, &ctx->a, a_bytes, RKNPU_MEM_SYNC_TO_DEVICE);
 	buf_sync(ctx, &ctx->b, b_bytes, RKNPU_MEM_SYNC_TO_DEVICE);
@@ -579,21 +717,7 @@ int rk_gemm_f32(rk_ctx *ctx, int M, int N, int K,
 	/* ---- C: copy (and reduce over K chunks) from row-major [Mp][Nc] tiles ---- */
 	buf_sync(ctx, &ctx->c, c_bytes, RKNPU_MEM_SYNC_FROM_DEVICE);
 	t0 = now_us();
-	#pragma omp parallel for schedule(static) num_threads(nthr)
-	for (int m = 0; m < M; m++) {
-		float *crow = C + (int64_t)m * ldc;
-		for (int c = 0; c < nn; c++) {
-			int n0 = c * Nc;
-			int ncols = N - n0 < Nc ? N - n0 : Nc;
-			const float *src = cp + (size_t)c * c_tile + (size_t)m * Nc;
-			if (nk == 1 && !accumulate) { memcpy(crow + n0, src, (size_t)ncols * 4); continue; }
-			for (int n = 0; n < ncols; n++) {
-				float acc = 0.f;
-				for (int j = 0; j < nk; j++) acc += cp[(size_t)(j * nn + c) * c_tile + (size_t)m * Nc + n];
-				if (accumulate) crow[n0 + n] += acc; else crow[n0 + n] = acc;
-			}
-		}
-	}
+	parallel_for(ctx, M, 64, unpack_range, &job);
 	ctx->stats.unpack_us = now_us() - t0;
 	ctx->stats.total_us = now_us() - t_start;
 	return 0;
