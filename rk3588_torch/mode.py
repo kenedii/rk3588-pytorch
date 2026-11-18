@@ -29,11 +29,24 @@ def _big_enough(m, n, k):
 
 
 class NPUMode(TorchFunctionMode):
-    def __init__(self, linear=True, matmul=True, conv=False):
+    def __init__(self, linear=True, matmul=True, conv=False, precision=None):
         super().__init__()
+        self.precision = precision
+        self._prev_precision = None
         self.linear = linear
         self.matmul = matmul
         self.conv = conv
+
+    def __enter__(self):
+        if self.precision is not None:
+            self._prev_precision = ops.set_precision(self.precision)
+        return super().__enter__()
+
+    def __exit__(self, *exc):
+        if self._prev_precision is not None:
+            ops.set_precision(self._prev_precision)
+            self._prev_precision = None
+        return super().__exit__(*exc)
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}

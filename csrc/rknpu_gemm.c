@@ -29,6 +29,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <drm/drm.h>
+#include <math.h>
 #include <pthread.h>
 #include <sched.h>
 
@@ -66,6 +67,9 @@ struct rk_ctx {
 	int      timeout_ms;
 	int      reuse;
 	struct pool *pool;
+	int      autoscale;
+	float   *scr[3];
+	size_t   scr_n[3];
 	rk_buf   regcmd, tasks, a, b, c;
 	rk_stats stats;
 	char     err[256];
@@ -125,6 +129,7 @@ rk_ctx *rk_open(const char *dev) {
 	ctx->max_n = env_int("RKNPU_MAX_N", 4096);
 	ctx->timeout_ms = env_int("RKNPU_TIMEOUT_MS", 3000);
 	ctx->reuse = env_int("RKNPU_WEIGHT_REUSE", 1);
+	ctx->autoscale = env_int("RKNPU_AUTOSCALE", 1);
 
 	return ctx;
 }
@@ -146,6 +151,7 @@ void rk_close(rk_ctx *ctx) {
 	buf_free(ctx, &ctx->b);
 	buf_free(ctx, &ctx->c);
 	pool_destroy(ctx->pool);
+	for (int i = 0; i < 3; i++) free(ctx->scr[i]);
 	close(ctx->fd);
 	free(ctx);
 }
@@ -207,7 +213,27 @@ static void buf_sync(rk_ctx *ctx, rk_buf *b, size_t size, uint32_t dir) {
 	ctx->stats.sync_us += now_us() - t0;
 }
 
+/*
+ * Per-precision constants, recovered from librknnrt command streams (fp16->fp32,
+ * fp16->fp16, int8->int32) or probed (see tools/prec_probe.c).
+ */
 typedef struct {
+	int in_prec, proc_prec, out_prec;   /* CNA input / MAC / DPU output precision codes */
+	int in_bytes, out_bytes;
+	int kgroup;                         /* kernels per weight group in the B layout */
+	int qd_en;                          /* CORE_MISC_CFG bit 0 */
+	uint32_t bs_ow;                     /* DPU_BS_OW_CFG */
+	uint32_t cvt_scale, cvt_shift;      /* DPU_OUT_CVT_SCALE / SHIFT */
+	uint32_t surf_add;                  /* DPU_SURFACE_ADD (>> 4) */
+} dtype_t;
+
+static const dtype_t DT_F16_F32 = { PREC_FP16, PREC_FP16, PREC_FP32, 2, 4, 16, 1, 0x36e, 1, 0, 4 };
+static const dtype_t DT_F16_F16 = { PREC_FP16, PREC_FP16, PREC_FP16, 2, 2, 16, 0, 0x126, 0x10001, 0, 2 };
+static const dtype_t DT_I8_I32  = { PREC_INT8, PREC_INT8, PREC_INT32, 1, 4, 32, 1, 0x7fc, 1, 0, 8 };
+static const dtype_t DT_BF16_F32 = { PREC_BF16, PREC_BF16, PREC_FP32, 2, 4, 16, 1, 0x36e, 1, 0, 4 };
+
+typedef struct {
+	const dtype_t *dt;
 	int m, k, n;            /* rows in this task, channels, kernels */
 	int grains;             /* feature rows the CNA preloads */
 	int dbanks, wbanks;     /* CBUF split */
@@ -215,11 +241,15 @@ typedef struct {
 	uint32_t in_dma, w_dma, out_dma, next_dma;
 } task_desc;
 
-/* Register stream for one row-major fp16 x fp16 -> fp32 matmul task. */
+/* Register stream for one row-major matmul task (precisions from t->dt). */
 static void emit_task(uint64_t *o, const task_desc *t) {
+	const dtype_t *dt = t->dt;
 	const uint32_t m = t->m, k = t->k, n = t->n;
+	const uint32_t kb = k * (uint32_t)dt->in_bytes;                   /* bytes per row / kernel */
+	const uint32_t notch = n * (uint32_t)dt->out_bytes / 16 - 1;      /* 16-byte output atoms per row - 1 */
 	const uint32_t cbuf = (t->reuse ? CBUF_WEIGHT_REUSE : 0) | ((uint32_t)t->wbanks << 4) | (uint32_t)t->dbanks;
-	const uint32_t conv1 = (1u << 29) | (PREC_FP16 << 7) | (PREC_FP16 << 4);  /* bit 29: row-major feature input */
+	/* bit 29: row-major feature input */
+	const uint32_t conv1 = (1u << 29) | ((uint32_t)dt->proc_prec << 7) | ((uint32_t)dt->in_prec << 4);
 	int i = 0;
 #define R(blk, reg, val) (o[i++] = npuop((blk), (uint32_t)(val), (reg)))
 	R(OP_REG_CNA, CNA_CBUF_CON0, cbuf);
@@ -234,11 +264,11 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_CNA, CNA_DATA_SIZE1, ((k - 1) << 16) | k);
 	R(OP_REG_CNA, CNA_DATA_SIZE2, 1);
 	R(OP_REG_CNA, CNA_DATA_SIZE3, m & 0x3FFFF);
-	R(OP_REG_CNA, CNA_WEIGHT_SIZE0, k * 2u * n);
-	R(OP_REG_CNA, CNA_WEIGHT_SIZE1, (k * 2u) & 0x7FFFF);
+	R(OP_REG_CNA, CNA_WEIGHT_SIZE0, kb * n);
+	R(OP_REG_CNA, CNA_WEIGHT_SIZE1, kb & 0x7FFFF);
 	R(OP_REG_CNA, CNA_WEIGHT_SIZE2, (1u << 24) | (1u << 16) | (n & 0x3FFF));
 	R(OP_REG_CNA, CNA_CBUF_CON0, cbuf);
-	R(OP_REG_CNA, CNA_CBUF_CON1, ((k + 31) / 32) & 0x1FFF);
+	R(OP_REG_CNA, CNA_CBUF_CON1, ((kb + 63) / 64) & 0x1FFF);
 	R(OP_REG_CNA, CNA_CVT_CON0, (1 << 3) | (1 << 1) | 1);
 	R(OP_REG_CNA, CNA_CVT_CON1, 1u << 16);
 	R(OP_REG_CNA, CNA_CVT_CON2, 1u << 16);
@@ -250,7 +280,7 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_CNA, CNA_FEATURE_DATA_ADDR, t->in_dma);
 	R(OP_REG_CNA, CNA_FC_CON2, 0);
 	R(OP_REG_CNA, CNA_DMA_CON0, (15u << 16) | 15u);
-	R(OP_REG_CNA, CNA_DMA_CON1, k / 8);          /* line stride: one row of A, in 16-byte units */
+	R(OP_REG_CNA, CNA_DMA_CON1, kb / 16);        /* line stride: one row of A, in 16-byte units */
 	R(OP_REG_CNA, CNA_DMA_CON2, 0);              /* surface stride: channel groups are contiguous */
 	R(OP_REG_CNA, CNA_FC_DATA_SIZE0, (1u << 16) | (m & 0x7FF));
 	R(OP_REG_CNA, CNA_FC_DATA_SIZE1, k & 0xFFFF);
@@ -261,26 +291,26 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_CNA, CNA_CVT_CON5, 0);
 	R(OP_REG_CNA, CNA_PAD_CON1, 0);
 
-	R(OP_REG_CORE, CORE_MISC_CFG, (PREC_FP16 << 8) | 1);
+	R(OP_REG_CORE, CORE_MISC_CFG, ((uint32_t)dt->proc_prec << 8) | (uint32_t)dt->qd_en);
 	R(OP_REG_CORE, CORE_DATAOUT_SIZE_0, (m - 1) << 16);
 	R(OP_REG_CORE, CORE_DATAOUT_SIZE_1, n - 1);
 	R(OP_REG_CORE, CORE_CLIP_TRUNCATE, 0);
 	R(OP_REG_CORE, CORE_3030, 0);
 
 	R(OP_REG_DPU, DPU_FEATURE_MODE_CFG, (15u << 5) | (2u << 1));
-	R(OP_REG_DPU, DPU_DATA_FORMAT, ((uint32_t)PREC_FP32 << 29) | (PREC_FP16 << 26) | PREC_FP16);
+	R(OP_REG_DPU, DPU_DATA_FORMAT, ((uint32_t)dt->out_prec << 29) | ((uint32_t)dt->proc_prec << 26) | (uint32_t)dt->proc_prec);
 	R(OP_REG_DPU, DPU_OFFSET_PEND, 0);
 	R(OP_REG_DPU, DPU_DST_BASE_ADD, t->out_dma);
 	R(OP_REG_DPU, DPU_DST_SURF_STRIDE, 1u << 4);  /* row-major output: 4-float atoms are adjacent */
 	R(OP_REG_DPU, DPU_DATA_CUBE_WIDTH, 0);
 	R(OP_REG_DPU, DPU_DATA_CUBE_HEIGHT, (m - 1) & 0x1FFF);
-	R(OP_REG_DPU, DPU_DATA_CUBE_NOTCH_ADDR, ((n / 4 - 1) << 16) | (n / 4 - 1));
+	R(OP_REG_DPU, DPU_DATA_CUBE_NOTCH_ADDR, (notch << 16) | notch);
 	R(OP_REG_DPU, DPU_DATA_CUBE_CHANNEL, ((n - 1) << 16) | (n - 1));
 	R(OP_REG_DPU, DPU_BS_CFG, (1 << 6) | (1 << 4) | (1 << 1) | 1);
 	R(OP_REG_DPU, DPU_BS_ALU_CFG, 0);
 	R(OP_REG_DPU, DPU_BS_MUL_CFG, 0);
 	R(OP_REG_DPU, DPU_BS_RELUX_CMP_VALUE, 0);
-	R(OP_REG_DPU, DPU_BS_OW_CFG, (3 << 8) | (3 << 5) | (3 << 2) | (1 << 1));
+	R(OP_REG_DPU, DPU_BS_OW_CFG, dt->bs_ow);
 	R(OP_REG_DPU, DPU_BS_OW_OP, 0);
 	R(OP_REG_DPU, DPU_WDMA_SIZE_0, (n - 1) & 0x1FFF);
 	R(OP_REG_DPU, DPU_WDMA_SIZE_1, ((m - 1) & 0x1FFF) << 16);
@@ -293,10 +323,10 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_DPU, DPU_EW_CVT_SCALE_VALUE, 1);
 	R(OP_REG_DPU, DPU_EW_RELUX_CMP_VALUE, 0);
 	R(OP_REG_DPU, DPU_OUT_CVT_OFFSET, 0);
-	R(OP_REG_DPU, DPU_OUT_CVT_SCALE, 1);
-	R(OP_REG_DPU, DPU_OUT_CVT_SHIFT, 0);
+	R(OP_REG_DPU, DPU_OUT_CVT_SCALE, dt->cvt_scale);
+	R(OP_REG_DPU, DPU_OUT_CVT_SHIFT, dt->cvt_shift);
 	for (int r = 0; r < 8; r++) R(OP_REG_DPU, DPU_EW_OP_VALUE_0 + 4 * r, 0);
-	R(OP_REG_DPU, DPU_SURFACE_ADD, 4u << 4);
+	R(OP_REG_DPU, DPU_SURFACE_ADD, dt->surf_add << 4);
 	R(OP_REG_DPU, DPU_40C4, 0);
 	for (int r = 0; r < 12; r++) R(OP_REG_DPU, DPU_LUT_ACCESS_CFG + 4 * r, 0);
 	/* i == 108: PC tail, chaining to the next task's register stream if any */
@@ -481,152 +511,273 @@ static void parallel_for(rk_ctx *ctx, int total, int grain, range_fn fn, void *a
 static inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 static inline int round_up(int a, int b) { return ceil_div(a, b) * b; }
 
-/* Convert rows [r0, r1) of op(A) (fp32, strided) into a row-major fp16 [rows][Kc] chunk. */
-static void pack_a_rows(f16 *dst, const float *A, int64_t sa_m, int64_t sa_k, int M, int K,
-                        int r0, int r1, int k0, int Kc) {
-	for (int m = r0; m < r1; m++) {
-		f16 *d = dst + (size_t)m * Kc;
-		int kend = K - k0 < Kc ? K - k0 : Kc;
-		if (m >= M) { memset(d, 0, (size_t)Kc * 2); continue; }
-		if (kend < 0) kend = 0;
-		const float *s = A + (int64_t)m * sa_m + (int64_t)k0 * sa_k;
-		if (sa_k == 1) { for (int k = 0; k < kend; k++) d[k] = (f16)s[k]; }
-		else { for (int k = 0; k < kend; k++) d[k] = (f16)s[(int64_t)k * sa_k]; }
-		for (int k = kend; k < Kc; k++) d[k] = (f16)0;
-	}
+/* ------------------------------------------------------------------------------------
+ * Element conversion
+ * ---------------------------------------------------------------------------------- */
+enum { CV_F16, CV_BF16, CV_I8 };
+
+static inline uint16_t f32_to_bf16(float x) {
+	uint32_t u;
+	memcpy(&u, &x, 4);
+	if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x40);  /* NaN stays NaN */
+	u += 0x7fffu + ((u >> 16) & 1u);                                          /* round to nearest even */
+	return (uint16_t)(u >> 16);
 }
 
-/* Transposed source (sa_m == 1): walk in 16x64 blocks to keep reads and writes cached. */
-static void pack_a_blocked(f16 *dst, const float *A, int64_t sa_k, int M, int K, int r0, int r1, int k0, int Kc) {
-	for (int mb = r0; mb < r1; mb += 16) {
-		int me = mb + 16 < r1 ? mb + 16 : r1;
-		for (int kb = 0; kb < Kc; kb += 64) {
-			int ke = kb + 64 < Kc ? kb + 64 : Kc;
-			for (int k = kb; k < ke; k++) {
-				int gk = k0 + k;
-				const float *s = A + (int64_t)gk * sa_k;
-				for (int m = mb; m < me; m++)
-					dst[(size_t)m * Kc + k] = (m < M && gk < K) ? (f16)s[m] : (f16)0;
+static inline int8_t f32_to_i8(float x) {
+	float r = __builtin_roundf(x);
+	if (r > 127.f) r = 127.f;
+	if (r < -127.f) r = -127.f;
+	return (int8_t)r;
+}
+
+typedef struct {
+	const dtype_t *dt;
+	int cv;                               /* CV_* input conversion */
+	const float *A, *B;
+	int64_t sa_m, sa_k, sb_k, sb_n;
+	int M, N, K, Mp, Kc, Nc, nk, nn, nblk;
+	void *ap, *bp, *cp;
+	size_t a_chunk, b_tile, c_tile;       /* elements */
+	float a_scale, b_scale;               /* uniform input scales (fp16/bf16) */
+	const float *a_row, *b_col;           /* per-row / per-column scales (int8) */
+	float *C;
+	int64_t ldc;
+	int accumulate;
+	float out_mul;                        /* applied to every output (undo input scales) */
+	float *amax_part;                     /* scratch for max-abs reductions */
+} job_t;
+
+/* write one converted element of A row m / B column n */
+#define CONV_A(J, x, m) ((J)->cv == CV_I8 ? (x) * (J)->a_row[m] : (x) * (J)->a_scale)
+#define CONV_B(J, x, n) ((J)->cv == CV_I8 ? (x) * (J)->b_col[n] : (x) * (J)->b_scale)
+
+static inline void store_el(int cv, void *base, size_t idx, float v) {
+	if (cv == CV_F16) ((f16 *)base)[idx] = (f16)v;
+	else if (cv == CV_BF16) ((uint16_t *)base)[idx] = f32_to_bf16(v);
+	else ((int8_t *)base)[idx] = f32_to_i8(v);
+}
+
+/* A: row-major [Mp][Kc] per K chunk; items are (K chunk, 16-row block) */
+static void pack_a_range(void *v, int b, int e) {
+	job_t *J = v;
+	const int Kc = J->Kc, K = J->K, M = J->M, cv = J->cv;
+	for (int it = b; it < e; it++) {
+		int j = it / J->nblk, bk = it % J->nblk;
+		int r0 = bk * 16, r1 = r0 + 16 < J->Mp ? r0 + 16 : J->Mp;
+		int k0 = j * Kc;
+		size_t base = (size_t)j * J->a_chunk;
+		int kend = K - k0 < Kc ? K - k0 : Kc;
+		if (J->sa_m == 1 && J->sa_k != 1) {
+			/* transposed source: walk k-major so reads are contiguous along m */
+			for (int k = 0; k < Kc; k++) {
+				const float *s = J->A + (int64_t)(k0 + k) * J->sa_k;
+				for (int m = r0; m < r1; m++) {
+					float x = (m < M && k < kend) ? CONV_A(J, s[m], m) : 0.f;
+					store_el(cv, J->ap, base + (size_t)m * Kc + k, x);
+				}
+			}
+			continue;
+		}
+		for (int m = r0; m < r1; m++) {
+			size_t d = base + (size_t)m * Kc;
+			if (m >= M) { for (int k = 0; k < Kc; k++) store_el(cv, J->ap, d + k, 0.f); continue; }
+			const float *s = J->A + (int64_t)m * J->sa_m + (int64_t)k0 * J->sa_k;
+			if (cv == CV_F16 && J->sa_k == 1) {
+				f16 *dd = (f16 *)J->ap + d;
+				const float sc = J->a_scale;
+				for (int k = 0; k < kend; k++) dd[k] = (f16)(s[k] * sc);
+				for (int k = kend; k < Kc; k++) dd[k] = (f16)0;
+			} else if (cv == CV_BF16 && J->sa_k == 1) {
+				uint16_t *dd = (uint16_t *)J->ap + d;
+				for (int k = 0; k < kend; k++) dd[k] = f32_to_bf16(s[k]);
+				for (int k = kend; k < Kc; k++) dd[k] = 0;
+			} else if (cv == CV_I8 && J->sa_k == 1) {
+				int8_t *dd = (int8_t *)J->ap + d;
+				const float sc = J->a_row[m];
+				for (int k = 0; k < kend; k++) dd[k] = f32_to_i8(s[k] * sc);
+				for (int k = kend; k < Kc; k++) dd[k] = 0;
+			} else {
+				for (int k = 0; k < kend; k++) store_el(cv, J->ap, d + k, CONV_A(J, s[(int64_t)k * J->sa_k], m));
+				for (int k = kend; k < Kc; k++) store_el(cv, J->ap, d + k, 0.f);
 			}
 		}
 	}
 }
 
-typedef struct {
-	const float *A, *B;
-	int64_t sa_m, sa_k, sb_k, sb_n;
-	int M, N, K, Mp, Kc, Nc, nk, nn, nblk;
-	f16 *ap, *bp;
-	float *cp;
-	size_t a_chunk, b_tile, c_tile;
-	float *C;
-	int64_t ldc;
-	int accumulate;
-} pack_job;
-
-/* A: fp32 -> fp16, row-major [Mp][Kc] per K chunk; items are (K chunk, 16-row block) */
-static void pack_a_range(void *v, int b, int e) {
-	pack_job *J = v;
+/* B: kernel groups [Nc/G][Kc/32][G][32] per (K chunk, N chunk); items are G-kernel groups */
+static void pack_b_range(void *v, int b, int e) {
+	job_t *J = v;
+	const int Kc = J->Kc, Nc = J->Nc, K = J->K, N = J->N, G = J->dt->kgroup, cv = J->cv;
+	const int64_t sb_k = J->sb_k, sb_n = J->sb_n;
 	for (int it = b; it < e; it++) {
-		int j = it / J->nblk, bk = it % J->nblk;
-		int r0 = bk * 16, r1 = r0 + 16 < J->Mp ? r0 + 16 : J->Mp;
-		if (J->sa_k == 1 || J->sa_m != 1)
-			pack_a_rows(J->ap + j * J->a_chunk, J->A, J->sa_m, J->sa_k, J->M, J->K, r0, r1, j * J->Kc, J->Kc);
-		else
-			pack_a_blocked(J->ap + j * J->a_chunk, J->A, J->sa_k, J->M, J->K, r0, r1, j * J->Kc, J->Kc);
+		int jc = it / (Nc / G), ng = it % (Nc / G);
+		int j = jc / J->nn, c = jc % J->nn;
+		size_t dst = (size_t)jc * J->b_tile + (size_t)ng * G * Kc;
+		for (int cb = 0; cb < Kc / 32; cb++) {
+			for (int nr = 0; nr < G; nr++) {
+				int gn = c * Nc + ng * G + nr;
+				size_t d = dst + (size_t)cb * 32 * G + (size_t)nr * 32;
+				int k0 = j * Kc + cb * 32;
+				for (int t = 0; t < 32; t++) {
+					int gk = k0 + t;
+					float x = (gn < N && gk < K) ? CONV_B(J, J->B[(int64_t)gk * sb_k + (int64_t)gn * sb_n], gn) : 0.f;
+					store_el(cv, J->bp, d + t, x);
+				}
+			}
+		}
 	}
 }
 
-/* B: kernel groups [Nc/16][Kc/32][16][32] per (K chunk, N chunk); items are 16-kernel groups */
-static void pack_b_range(void *v, int b, int e) {
-	pack_job *J = v;
+/* fast path for the common fp16 case with B read along k (sb_k == 1, i.e. Linear weights) */
+static void pack_b_f16_range(void *v, int b, int e) {
+	job_t *J = v;
 	const int Kc = J->Kc, Nc = J->Nc, K = J->K, N = J->N;
-	const float *B = J->B;
-	const int64_t sb_k = J->sb_k, sb_n = J->sb_n;
+	const float sc = J->b_scale;
 	for (int it = b; it < e; it++) {
 		int jc = it / (Nc / 16), ng = it % (Nc / 16);
 		int j = jc / J->nn, c = jc % J->nn;
-		f16 *dst = J->bp + (size_t)jc * J->b_tile + (size_t)ng * 16 * Kc;
-		if (sb_n == 1 && sb_k != 1) {
-			/* B row-major (k, n): read 16 consecutive n per k */
+		f16 *dst = (f16 *)J->bp + (size_t)jc * J->b_tile + (size_t)ng * 16 * Kc;
+		if (J->sb_n == 1 && J->sb_k != 1) {
 			for (int cb = 0; cb < Kc / 32; cb++)
 				for (int kr = 0; kr < 32; kr++) {
 					int gk = j * Kc + cb * 32 + kr;
-					const float *s = B + (int64_t)gk * sb_k + (int64_t)(c * Nc + ng * 16);
+					const float *s = J->B + (int64_t)gk * J->sb_k + (int64_t)(c * Nc + ng * 16);
 					for (int nr = 0; nr < 16; nr++) {
 						int gn = c * Nc + ng * 16 + nr;
-						dst[cb * 512 + nr * 32 + kr] = (gk < K && gn < N) ? (f16)s[nr] : (f16)0;
+						dst[cb * 512 + nr * 32 + kr] = (gk < K && gn < N) ? (f16)(s[nr] * sc) : (f16)0;
 					}
 				}
 		} else {
-			for (int cb = 0; cb < Kc / 32; cb++) {
+			for (int cb = 0; cb < Kc / 32; cb++)
 				for (int nr = 0; nr < 16; nr++) {
 					int gn = c * Nc + ng * 16 + nr;
 					f16 *d = dst + cb * 512 + nr * 32;
 					int k0 = j * Kc + cb * 32;
 					if (gn < N && k0 + 32 <= K) {
-						const float *s = B + (int64_t)k0 * sb_k + (int64_t)gn * sb_n;
-						if (sb_k == 1) { for (int t = 0; t < 32; t++) d[t] = (f16)s[t]; }
-						else { for (int t = 0; t < 32; t++) d[t] = (f16)s[(int64_t)t * sb_k]; }
+						const float *s = J->B + (int64_t)k0 * J->sb_k + (int64_t)gn * J->sb_n;
+						if (J->sb_k == 1) { for (int t = 0; t < 32; t++) d[t] = (f16)(s[t] * sc); }
+						else { for (int t = 0; t < 32; t++) d[t] = (f16)(s[(int64_t)t * J->sb_k] * sc); }
 					} else {
 						for (int t = 0; t < 32; t++) {
 							int gk = k0 + t;
-							d[t] = (gn < N && gk < K) ? (f16)B[(int64_t)gk * sb_k + (int64_t)gn * sb_n] : (f16)0;
+							d[t] = (gn < N && gk < K) ? (f16)(J->B[(int64_t)gk * J->sb_k + (int64_t)gn * J->sb_n] * sc) : (f16)0;
 						}
 					}
 				}
-			}
 		}
 	}
 }
 
-/* C: copy (and reduce over K chunks) rows of the row-major [Mp][Nc] output tiles */
+/* C: row-major [Mp][Nc] tiles -> C, reducing K chunks and undoing input scales */
 static void unpack_range(void *v, int b, int e) {
-	pack_job *J = v;
+	job_t *J = v;
+	const int ob = J->dt->out_prec;
+	if (ob == PREC_FP32 && J->nk == 1) {
+		/* fast path: one K chunk, fp32 tiles */
+		const float mul = J->out_mul;
+		for (int m = b; m < e; m++) {
+			float *crow = J->C + (int64_t)m * J->ldc;
+			for (int c = 0; c < J->nn; c++) {
+				int n0 = c * J->Nc;
+				int ncols = J->N - n0 < J->Nc ? J->N - n0 : J->Nc;
+				const float *src = (const float *)J->cp + (size_t)c * J->c_tile + (size_t)m * J->Nc;
+				if (J->accumulate) { for (int n = 0; n < ncols; n++) crow[n0 + n] += src[n] * mul; }
+				else if (mul == 1.f) memcpy(crow + n0, src, (size_t)ncols * 4);
+				else { for (int n = 0; n < ncols; n++) crow[n0 + n] = src[n] * mul; }
+			}
+		}
+		return;
+	}
 	for (int m = b; m < e; m++) {
 		float *crow = J->C + (int64_t)m * J->ldc;
+		const float rs = J->cv == CV_I8 ? J->a_row[m] : 1.f;
 		for (int c = 0; c < J->nn; c++) {
 			int n0 = c * J->Nc;
 			int ncols = J->N - n0 < J->Nc ? J->N - n0 : J->Nc;
-			const float *src = J->cp + (size_t)c * J->c_tile + (size_t)m * J->Nc;
-			if (J->nk == 1 && !J->accumulate) { memcpy(crow + n0, src, (size_t)ncols * 4); continue; }
 			for (int n = 0; n < ncols; n++) {
-				float acc = 0.f;
-				for (int j = 0; j < J->nk; j++)
-					acc += J->cp[(size_t)(j * J->nn + c) * J->c_tile + (size_t)m * J->Nc + n];
+				size_t off = (size_t)m * J->Nc + n;
+				float acc;
+				if (ob == PREC_INT32) {
+					int64_t s = 0;
+					for (int jj = 0; jj < J->nk; jj++) s += ((int32_t *)J->cp)[(size_t)(jj * J->nn + c) * J->c_tile + off];
+					/* the int8 scales are multipliers into int8 range: divide them back out */
+					acc = (float)s / (rs * J->b_col[n0 + n]);
+				} else if (ob == PREC_FP16) {
+					acc = 0.f;
+					for (int jj = 0; jj < J->nk; jj++) acc += (float)((f16 *)J->cp)[(size_t)(jj * J->nn + c) * J->c_tile + off];
+				} else {
+					acc = 0.f;
+					for (int jj = 0; jj < J->nk; jj++) acc += ((float *)J->cp)[(size_t)(jj * J->nn + c) * J->c_tile + off];
+				}
+				acc *= J->out_mul;
 				if (J->accumulate) crow[n0 + n] += acc; else crow[n0 + n] = acc;
 			}
 		}
 	}
 }
 
-int rk_gemm_f32(rk_ctx *ctx, int M, int N, int K,
-                const float *A, int64_t sa_m, int64_t sa_k,
-                const float *B, int64_t sb_k, int64_t sb_n,
-                float *C, int64_t ldc, int accumulate) {
-	double t_start = now_us();
-	memset(&ctx->stats, 0, sizeof(ctx->stats));
-	if (M <= 0 || N <= 0 || K <= 0) { set_err(ctx, "bad shape"); return -1; }
+/* max |A(m,:)| per row (int8) or global max |A| into amax_part[item] */
+static void amax_a_rows(void *v, int b, int e) {
+	job_t *J = v;
+	for (int m = b; m < e; m++) {
+		float mx = 0.f;
+		for (int k = 0; k < J->K; k++) {
+			float x = __builtin_fabsf(J->A[(int64_t)m * J->sa_m + (int64_t)k * J->sa_k]);
+			if (x > mx) mx = x;
+		}
+		J->amax_part[m] = mx;
+	}
+}
+static void amax_b_cols(void *v, int b, int e) {
+	job_t *J = v;
+	for (int n = b; n < e; n++) {
+		float mx = 0.f;
+		for (int k = 0; k < J->K; k++) {
+			float x = __builtin_fabsf(J->B[(int64_t)k * J->sb_k + (int64_t)n * J->sb_n]);
+			if (x > mx) mx = x;
+		}
+		J->amax_part[n] = mx;
+	}
+}
 
-	/* ---- tiling plan ---- */
+/* power of two that puts `amax` near 2^14, well inside fp16 range on both ends */
+static float pow2_scale(float amax) {
+	if (!(amax > 0.f) || amax != amax || amax > 3e38f) return 1.f;
+	int e;
+	frexpf(amax, &e);            /* amax = f * 2^e, f in [0.5, 1) */
+	int sh = 14 - e;
+	if (sh > 100) sh = 100;
+	if (sh < -100) sh = -100;
+	return ldexpf(1.f, sh);
+}
+
+/* ------------------------------------------------------------------------------------
+ * Engine: one tiled, chained, multi-core NPU matmul
+ * ---------------------------------------------------------------------------------- */
+static int gemm_engine(rk_ctx *ctx, job_t *J) {
+	const dtype_t *dt = J->dt;
+	const int ib = dt->in_bytes, ob = dt->out_bytes, G = dt->kgroup;
+	const int M = J->M, N = J->N, K = J->K;
+
 	int Kp = round_up(K, 32);
 	int nk = ceil_div(Kp, ctx->max_k);
 	int Kc = round_up(ceil_div(Kp, nk), 32);
-	int Np = round_up(N, 16);
+	int Np = round_up(N, G);
 	int nn = ceil_div(Np, ctx->max_n);
-	int Nc = round_up(ceil_div(Np, nn), 16);
+	int Nc = round_up(ceil_div(Np, nn), G);
 	int Mp = round_up(M, 4);
-	/* weight banks: at least one 16-kernel group, and (like librknnrt) up to 4 banks or
+	/* weight banks: at least one kernel group, and (like librknnrt) up to 4 banks or
 	 * whatever holds all weights; leaving a single bank for streamed weights hangs the CNA */
-	int wbanks_min = ceil_div(16 * Kc * 2, CBUF_BANK_SIZE);
-	int wall = ceil_div(Kc * 2 * Nc, CBUF_BANK_SIZE);
+	int wbanks_min = ceil_div(G * Kc * ib, CBUF_BANK_SIZE);
+	int wall = ceil_div(Kc * ib * Nc, CBUF_BANK_SIZE);
 	int wfloor = env_int("RKNPU_MIN_WBANKS", 4);
 	if (wall < wfloor) wfloor = wall;
 	if (wbanks_min < wfloor) wbanks_min = wfloor;
 	int dbanks_max = CBUF_BANKS - wbanks_min;
 	if (dbanks_max < 1) { set_err(ctx, "K chunk %d too large for CBUF", Kc); return -1; }
 	/* rows per task: (rows + 1) must fit in the data banks so the CNA can preload rows + 1 */
-	int Mt = (int)((dbanks_max * (long)CBUF_BANK_SIZE) / (Kc * 2)) - 1;
+	int Mt = (int)((dbanks_max * (long)CBUF_BANK_SIZE) / (Kc * ib)) - 1;
 	Mt &= ~3;
 	if (Mt > ctx->max_m) Mt = ctx->max_m & ~3;
 	if (Mt > Mp) Mt = Mp;
@@ -634,17 +785,15 @@ int rk_gemm_f32(rk_ctx *ctx, int M, int N, int K,
 	int nm = ceil_div(Mp, Mt);
 	Mt = round_up(ceil_div(Mp, nm), 4);   /* rebalance */
 	Mp = Mt * nm;
-	int dbanks = ceil_div((Mt + 1) * Kc * 2, CBUF_BANK_SIZE);
+	int dbanks = ceil_div((Mt + 1) * Kc * ib, CBUF_BANK_SIZE);
 	int wbanks = CBUF_BANKS - dbanks;
-	int weights_fit = (long)Kc * 2 * Nc <= (long)wbanks * CBUF_BANK_SIZE;
+	int weights_fit = (long)Kc * ib * Nc <= (long)wbanks * CBUF_BANK_SIZE;
 	int T = nm * nk * nn;
 	ctx->stats.m_tile = Mt; ctx->stats.k_tile = Kc; ctx->stats.n_tile = Nc;
-	ctx->stats.tasks = T;
+	ctx->stats.tasks += T;
 
-	size_t a_chunk = (size_t)Mp * Kc;   /* fp16 elements per K chunk */
-	size_t b_tile = (size_t)Nc * Kc;    /* fp16 elements per (K chunk, N chunk) */
-	size_t c_tile = (size_t)Mp * Nc;    /* fp32 elements per (K chunk, N chunk) */
-	size_t a_bytes = a_chunk * nk * 2, b_bytes = b_tile * nk * nn * 2, c_bytes = c_tile * nk * nn * 4;
+	size_t a_chunk = (size_t)Mp * Kc, b_tile = (size_t)Nc * Kc, c_tile = (size_t)Mp * Nc;
+	size_t a_bytes = a_chunk * nk * ib, b_bytes = b_tile * nk * nn * ib, c_bytes = c_tile * nk * nn * ob;
 	uint32_t dflags = MEM_FLAG_400 | RKNPU_MEM_CACHEABLE | RKNPU_MEM_NON_CONTIGUOUS;
 	if (buf_ensure(ctx, &ctx->a, a_bytes, dflags) ||
 	    buf_ensure(ctx, &ctx->b, b_bytes, dflags) ||
@@ -653,21 +802,22 @@ int rk_gemm_f32(rk_ctx *ctx, int M, int N, int K,
 	    buf_ensure(ctx, &ctx->tasks, (size_t)T * sizeof(struct rknpu_task), dflags | RKNPU_MEM_KERNEL_MAPPING))
 		return -1;
 
-	pack_job job = {
-		.A = A, .B = B, .sa_m = sa_m, .sa_k = sa_k, .sb_k = sb_k, .sb_n = sb_n,
-		.M = M, .N = N, .K = K, .Mp = Mp, .Kc = Kc, .Nc = Nc, .nk = nk, .nn = nn,
-		.ap = ctx->a.ptr, .bp = ctx->b.ptr, .cp = ctx->c.ptr, .a_chunk = a_chunk, .b_tile = b_tile,
-		.c_tile = c_tile, .C = C, .ldc = ldc, .accumulate = accumulate,
-	};
-	job.nblk = ceil_div(Mp, 16);
+	J->Mp = Mp; J->Kc = Kc; J->Nc = Nc; J->nk = nk; J->nn = nn;
+	J->ap = ctx->a.ptr; J->bp = ctx->b.ptr; J->cp = ctx->c.ptr;
+	J->a_chunk = a_chunk; J->b_tile = b_tile; J->c_tile = c_tile;
+	J->nblk = ceil_div(Mp, 16);
+
 	double t0 = now_us();
-	parallel_for(ctx, nk * job.nblk, 4, pack_a_range, &job);
-	parallel_for(ctx, nk * nn * (Nc / 16), 1, pack_b_range, &job);
-	ctx->stats.pack_us = now_us() - t0;
+	if (J->A) parallel_for(ctx, nk * J->nblk, 4, pack_a_range, J);
+	if (J->B) {
+		if (J->cv == CV_F16 && G == 16) parallel_for(ctx, nk * nn * (Nc / 16), 1, pack_b_f16_range, J);
+		else parallel_for(ctx, nk * nn * (Nc / G), 1, pack_b_range, J);
+	}
+	ctx->stats.pack_us += now_us() - t0;
 	buf_sync(ctx, &ctx->a, a_bytes, RKNPU_MEM_SYNC_TO_DEVICE);
 	buf_sync(ctx, &ctx->b, b_bytes, RKNPU_MEM_SYNC_TO_DEVICE);
 
-	/* ---- register streams: task order (j, c, i) so consecutive tasks share weights ---- */
+	/* register streams: task order (j, c, i) so consecutive tasks share weights */
 	uint64_t *rc = ctx->regcmd.ptr;
 	struct rknpu_task *tk = ctx->tasks.ptr;
 	int cores = ctx->mode == 2 ? 3 : 1;
@@ -676,7 +826,6 @@ int rk_gemm_f32(rk_ctx *ctx, int M, int N, int K,
 		int i = t % nm, jc = t / nm, j = jc / nn;
 		int sub_start = (t / per_submit) * per_submit;
 		int sub_count = T - sub_start < per_submit ? T - sub_start : per_submit;
-		/* first/last task of each chain (one chain per submit, or per core in mode 2) */
 		int first = 0, last = 0;
 		if (ctx->mode == 0) first = last = 1;
 		else if (cores == 1 || sub_count < 3) { first = t == sub_start; last = t == sub_start + sub_count - 1; }
@@ -690,11 +839,11 @@ int rk_gemm_f32(rk_ctx *ctx, int M, int N, int K,
 			}
 		}
 		task_desc d = {
-			.m = Mt, .k = Kc, .n = Nc, .grains = Mt + 1, .dbanks = dbanks, .wbanks = wbanks,
+			.dt = dt, .m = Mt, .k = Kc, .n = Nc, .grains = Mt + 1, .dbanks = dbanks, .wbanks = wbanks,
 			.reuse = ctx->reuse && weights_fit && !first && i > 0,
-			.in_dma = (uint32_t)(ctx->a.dma + ((size_t)j * a_chunk + (size_t)i * Mt * Kc) * 2),
-			.w_dma = (uint32_t)(ctx->b.dma + (size_t)jc * b_tile * 2),
-			.out_dma = (uint32_t)(ctx->c.dma + ((size_t)jc * c_tile + (size_t)i * Mt * Nc) * 4),
+			.in_dma = (uint32_t)(ctx->a.dma + ((size_t)j * a_chunk + (size_t)i * Mt * Kc) * ib),
+			.w_dma = (uint32_t)(ctx->b.dma + (size_t)jc * b_tile * ib),
+			.out_dma = (uint32_t)(ctx->c.dma + ((size_t)jc * c_tile + (size_t)i * Mt * Nc) * ob),
 			.next_dma = last ? 0 : (uint32_t)(ctx->regcmd.dma + (size_t)(t + 1) * REGCMD_SLOTS * 8),
 		};
 		emit_task(rc + (size_t)t * REGCMD_SLOTS, &d);
@@ -708,17 +857,189 @@ int rk_gemm_f32(rk_ctx *ctx, int M, int N, int K,
 	buf_sync(ctx, &ctx->regcmd, (size_t)T * REGCMD_SLOTS * 8, RKNPU_MEM_SYNC_TO_DEVICE);
 	buf_sync(ctx, &ctx->tasks, (size_t)T * sizeof(struct rknpu_task), RKNPU_MEM_SYNC_TO_DEVICE);
 
-	/* ---- run ---- */
 	for (int s = 0; s < T; s += per_submit) {
 		int cnt = T - s < per_submit ? T - s : per_submit;
 		if (submit(ctx, s, cnt, (cores == 3 && cnt >= 3) ? 3 : 1) < 0) return -1;
 	}
 
-	/* ---- C: copy (and reduce over K chunks) from row-major [Mp][Nc] tiles ---- */
 	buf_sync(ctx, &ctx->c, c_bytes, RKNPU_MEM_SYNC_FROM_DEVICE);
-	t0 = now_us();
-	parallel_for(ctx, M, 64, unpack_range, &job);
-	ctx->stats.unpack_us = now_us() - t0;
+	if (J->C) {
+		t0 = now_us();
+		parallel_for(ctx, M, 64, unpack_range, J);
+		ctx->stats.unpack_us += now_us() - t0;
+	}
+	return 0;
+}
+
+/* ------------------------------------------------------------------------------------
+ * Precision front-ends
+ * ---------------------------------------------------------------------------------- */
+static float *scratch(rk_ctx *ctx, int which, size_t n) {
+	if (ctx->scr_n[which] < n) {
+		free(ctx->scr[which]);
+		ctx->scr[which] = malloc(n * sizeof(float));
+		ctx->scr_n[which] = ctx->scr[which] ? n : 0;
+	}
+	return ctx->scr[which];
+}
+
+static float amax_all(rk_ctx *ctx, job_t *J, int rows, range_fn fn) {
+	J->amax_part = scratch(ctx, 0, (size_t)rows);
+	parallel_for(ctx, rows, 32, fn, J);
+	float mx = 0.f;
+	for (int i = 0; i < rows; i++) if (J->amax_part[i] > mx) mx = J->amax_part[i];
+	return mx;
+}
+
+/* split x*s into hi = fp16(x*s) and lo = fp16((x*s - hi) * 2^11), stored as fp32 */
+static void split_a_range(void *v, int b, int e) {
+	job_t *J = v;   /* reuses fields: A source, C = destination [M][2K] */
+	for (int m = b; m < e; m++) {
+		float *d = J->C + (size_t)m * 2 * J->K;
+		for (int k = 0; k < J->K; k++) {
+			float x = J->A[(int64_t)m * J->sa_m + (int64_t)k * J->sa_k] * J->a_scale;
+			float hi = (float)(f16)x;
+			d[k] = hi;
+			d[J->K + k] = (float)(f16)((x - hi) * 2048.f);
+		}
+	}
+}
+static void split_b_range(void *v, int b, int e) {
+	job_t *J = v;   /* destination [2K][N]: rows 0..K-1 = lo, rows K..2K-1 = hi */
+	for (int k = b; k < e; k++) {
+		float *lo = J->C + (size_t)k * J->N, *hi = J->C + (size_t)(J->K + k) * J->N;
+		for (int n = 0; n < J->N; n++) {
+			float x = J->B[(int64_t)k * J->sb_k + (int64_t)n * J->sb_n] * J->b_scale;
+			float h = (float)(f16)x;
+			hi[n] = h;
+			lo[n] = (float)(f16)((x - h) * 2048.f);
+		}
+	}
+}
+
+int rk_gemm_ex(rk_ctx *ctx, int prec, int M, int N, int K,
+               const float *A, int64_t sa_m, int64_t sa_k,
+               const float *B, int64_t sb_k, int64_t sb_n,
+               float *C, int64_t ldc, int accumulate) {
+	double t_start = now_us();
+	memset(&ctx->stats, 0, sizeof(ctx->stats));
+	if (M <= 0 || N <= 0 || K <= 0) { set_err(ctx, "bad shape"); return -1; }
+	job_t J = {
+		.A = A, .B = B, .sa_m = sa_m, .sa_k = sa_k, .sb_k = sb_k, .sb_n = sb_n,
+		.M = M, .N = N, .K = K, .C = C, .ldc = ldc, .accumulate = accumulate,
+		.a_scale = 1.f, .b_scale = 1.f, .out_mul = 1.f,
+	};
+	int r = -1;
+	double t0;
+	switch (prec) {
+	case RK_PREC_FP16:
+	case RK_PREC_BF16:
+	case RK_PREC_FP16_OUT16:
+		J.dt = prec == RK_PREC_BF16 ? &DT_BF16_F32 : prec == RK_PREC_FP16 ? &DT_F16_F32 : &DT_F16_F16;
+		J.cv = prec == RK_PREC_BF16 ? CV_BF16 : CV_F16;
+		if (prec == RK_PREC_FP16 && ctx->autoscale) {
+			/* exact power-of-two scaling keeps both operands inside fp16 range */
+			t0 = now_us();
+			J.a_scale = pow2_scale(amax_all(ctx, &J, M, amax_a_rows));
+			J.b_scale = pow2_scale(amax_all(ctx, &J, N, amax_b_cols));
+			J.out_mul = 1.f / (J.a_scale * J.b_scale);
+			ctx->stats.pack_us += now_us() - t0;
+		}
+		r = gemm_engine(ctx, &J);
+		break;
+	case RK_PREC_INT8: {
+		/* symmetric per-row (A) / per-column (B) quantization, exact int32 accumulation */
+		J.dt = &DT_I8_I32;
+		J.cv = CV_I8;
+		t0 = now_us();
+		float *ra = scratch(ctx, 1, (size_t)M), *cb = scratch(ctx, 2, (size_t)N);
+		amax_all(ctx, &J, M, amax_a_rows);
+		for (int m = 0; m < M; m++) ra[m] = J.amax_part[m] > 0.f ? 127.f / J.amax_part[m] : 1.f;
+		amax_all(ctx, &J, N, amax_b_cols);
+		for (int n = 0; n < N; n++) cb[n] = J.amax_part[n] > 0.f ? 127.f / J.amax_part[n] : 1.f;
+		J.a_row = ra;
+		J.b_col = cb;
+		ctx->stats.pack_us += now_us() - t0;
+		r = gemm_engine(ctx, &J);
+		break;
+	}
+	case RK_PREC_FP16X3: {
+		/* C = Ah*Bh + 2^-11 * (Ah*Bl' + Al'*Bh): two NPU GEMMs, ~fp32 accuracy */
+		t0 = now_us();
+		float sa = pow2_scale(amax_all(ctx, &J, M, amax_a_rows));
+		float sb = pow2_scale(amax_all(ctx, &J, N, amax_b_cols));
+		float *A2 = scratch(ctx, 1, (size_t)M * 2 * K), *B2 = scratch(ctx, 2, (size_t)2 * K * N);
+		if (!A2 || !B2) { set_err(ctx, "out of memory"); return -1; }
+		job_t S = J;
+		S.a_scale = sa; S.b_scale = sb;
+		S.C = A2; parallel_for(ctx, M, 8, split_a_range, &S);
+		S.C = B2; parallel_for(ctx, K, 8, split_b_range, &S);
+		ctx->stats.pack_us += now_us() - t0;
+		/* pass 1: Ah (first K columns of A2) x Bh (rows K..2K-1 of B2) */
+		job_t P = J;
+		P.dt = &DT_F16_F32; P.cv = CV_F16;
+		P.A = A2; P.sa_m = 2 * K; P.sa_k = 1;
+		P.B = B2 + (size_t)K * N; P.sb_k = N; P.sb_n = 1;
+		P.out_mul = 1.f / (sa * sb);
+		r = gemm_engine(ctx, &P);
+		if (r) break;
+		/* pass 2: [Ah | Al'] x [Bl' ; Bh] over 2K, scaled by 2^-11 and added */
+		job_t Q = J;
+		Q.dt = &DT_F16_F32; Q.cv = CV_F16;
+		Q.A = A2; Q.sa_m = 2 * K; Q.sa_k = 1; Q.K = 2 * K;
+		Q.B = B2; Q.sb_k = N; Q.sb_n = 1;
+		Q.out_mul = 1.f / (2048.f * sa * sb);
+		Q.accumulate = 1;
+		r = gemm_engine(ctx, &Q);
+		break;
+	}
+	default:
+		set_err(ctx, "unknown precision %d", prec);
+		return -1;
+	}
 	ctx->stats.total_us = now_us() - t_start;
+	return r;
+}
+
+int rk_gemm_f32(rk_ctx *ctx, int M, int N, int K,
+                const float *A, int64_t sa_m, int64_t sa_k,
+                const float *B, int64_t sb_k, int64_t sb_n,
+                float *C, int64_t ldc, int accumulate) {
+	return rk_gemm_ex(ctx, RK_PREC_FP16, M, N, K, A, sa_m, sa_k, B, sb_k, sb_n, C, ldc, accumulate);
+}
+
+/* ------------------------------------------------------------------------------------
+ * Raw probe: one task with caller-chosen precision codes and pre-laid-out bytes.
+ * ---------------------------------------------------------------------------------- */
+int rk_probe_raw(rk_ctx *ctx, const rk_probe_cfg *cfg, int M, int N, int K,
+                 const void *a_rows, const void *w_bytes, void *c_rows) {
+	dtype_t dt = { cfg->in_prec, cfg->proc_prec, cfg->out_prec, cfg->in_bytes, cfg->out_bytes,
+	               cfg->kgroup, cfg->qd_en, cfg->bs_ow, cfg->cvt_scale, cfg->cvt_shift, cfg->surf_add };
+	size_t a_bytes = (size_t)M * K * dt.in_bytes, w_bytes_n = (size_t)N * K * dt.in_bytes;
+	size_t c_bytes = (size_t)M * N * dt.out_bytes;
+	uint32_t dflags = MEM_FLAG_400 | RKNPU_MEM_CACHEABLE | RKNPU_MEM_NON_CONTIGUOUS;
+	if (buf_ensure(ctx, &ctx->a, a_bytes, dflags) || buf_ensure(ctx, &ctx->b, w_bytes_n, dflags) ||
+	    buf_ensure(ctx, &ctx->c, c_bytes, dflags) || buf_ensure(ctx, &ctx->regcmd, REGCMD_SLOTS * 8, dflags) ||
+	    buf_ensure(ctx, &ctx->tasks, sizeof(struct rknpu_task), dflags | RKNPU_MEM_KERNEL_MAPPING))
+		return -1;
+	memcpy(ctx->a.ptr, a_rows, a_bytes);
+	memcpy(ctx->b.ptr, w_bytes, w_bytes_n);
+	memset(ctx->c.ptr, 0x7f, c_bytes);   /* poison, so "not written" is visible */
+	buf_sync(ctx, &ctx->a, a_bytes, RKNPU_MEM_SYNC_TO_DEVICE);
+	buf_sync(ctx, &ctx->b, w_bytes_n, RKNPU_MEM_SYNC_TO_DEVICE);
+	buf_sync(ctx, &ctx->c, c_bytes, RKNPU_MEM_SYNC_TO_DEVICE);
+	int dbanks = ceil_div((M + 1) * K * dt.in_bytes, CBUF_BANK_SIZE);
+	task_desc d = { .dt = &dt, .m = M, .k = K, .n = N, .grains = M + 1, .dbanks = dbanks,
+	                .wbanks = CBUF_BANKS - dbanks, .reuse = 0, .in_dma = (uint32_t)ctx->a.dma,
+	                .w_dma = (uint32_t)ctx->b.dma, .out_dma = (uint32_t)ctx->c.dma, .next_dma = 0 };
+	emit_task(ctx->regcmd.ptr, &d);
+	struct rknpu_task td = { .enable_mask = 0xd, .int_mask = 0x300, .int_clear = 0x1ffff,
+	                         .regcfg_amount = REGCFG_AMOUNT, .regcmd_addr = ctx->regcmd.dma };
+	*(struct rknpu_task *)ctx->tasks.ptr = td;
+	buf_sync(ctx, &ctx->regcmd, REGCMD_SLOTS * 8, RKNPU_MEM_SYNC_TO_DEVICE);
+	buf_sync(ctx, &ctx->tasks, sizeof(td), RKNPU_MEM_SYNC_TO_DEVICE);
+	if (submit(ctx, 0, 1, 1) < 0) return -1;
+	buf_sync(ctx, &ctx->c, c_bytes, RKNPU_MEM_SYNC_FROM_DEVICE);
+	memcpy(c_rows, ctx->c.ptr, c_bytes);
 	return 0;
 }

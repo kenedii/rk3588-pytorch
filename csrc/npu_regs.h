@@ -112,6 +112,9 @@ static inline uint64_t npuop(uint32_t op, uint32_t value, uint32_t reg) {
 #define CBUF_BANK_SIZE 32768u
 #define CBUF_BANKS     12u
 
-enum { PREC_INT8 = 0, PREC_FP16 = 2, PREC_INT32 = 4, PREC_FP32 = 5 };
+/* precision codes: 0 (int8), 2 (fp16), 4 (int32 out), 5 (fp32 out) from vendor command streams;
+ * 3 (bf16) found with tools/prec_probe.c. 1 (int16) hangs the CNA; 5 as an input is not fp32
+ * (the CNA reads it as pairs of 16-bit values), so there is no fp32/tf32 MAC path. */
+enum { PREC_INT8 = 0, PREC_INT16 = 1, PREC_FP16 = 2, PREC_BF16 = 3, PREC_INT32 = 4, PREC_FP32 = 5 };
 
 #endif

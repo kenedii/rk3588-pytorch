@@ -10,7 +10,8 @@ everything else stays on the CPU.
 """
 from ._lib import NPU, default_npu
 from .mode import NPUMode, npu_mode, enable, disable
-from .ops import linear, matmul, bmm, conv2d, mm_raw, stats
+from .ops import linear, matmul, bmm, conv2d, mm_raw, stats, set_precision, get_precision
 
 __all__ = ["NPU", "default_npu", "NPUMode", "npu_mode", "enable", "disable",
-           "linear", "matmul", "bmm", "conv2d", "mm_raw", "stats"]
+           "linear", "matmul", "bmm", "conv2d", "mm_raw", "stats",
+           "set_precision", "get_precision"]

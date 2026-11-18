@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 csrc/gemm_test
+csrc/prec_probe
 venv/
 .claude/
 CLAUDE.md

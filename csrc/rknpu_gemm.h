@@ -52,6 +52,28 @@ int rk_gemm_f32(rk_ctx *ctx, int M, int N, int K,
 
 void rk_get_stats(rk_ctx *ctx, rk_stats *out);
 
+/* Precisions for rk_gemm_ex (all take and return fp32):
+ *   RK_PREC_FP16        fp16 x fp16, fp32 accumulate/output, power-of-two auto-scaling (default)
+ *   RK_PREC_FP16_OUT16  fp16 x fp16 -> fp16 output (no auto-scaling; outputs must fit fp16)
+ *   RK_PREC_INT8        int8 x int8 -> int32, per-row (A) / per-column (B) symmetric quantization
+ *   RK_PREC_FP16X3      split fp32 into fp16 hi + lo parts; 3 products, close to fp32 accuracy
+ *   RK_PREC_BF16        bf16 x bf16 -> fp32 (only if the hardware probe confirms it) */
+enum { RK_PREC_FP16 = 0, RK_PREC_FP16_OUT16 = 1, RK_PREC_INT8 = 2, RK_PREC_FP16X3 = 3, RK_PREC_BF16 = 4 };
+
+int rk_gemm_ex(rk_ctx *ctx, int prec, int M, int N, int K,
+               const float *A, int64_t sa_m, int64_t sa_k,
+               const float *B, int64_t sb_k, int64_t sb_n,
+               float *C, int64_t ldc, int accumulate);
+
+/* Hardware probing: one task, raw bytes, caller-chosen precision codes (M%4==0, K%32==0, N%16==0;
+ * a_rows is M x K row-major, w_bytes is N*K elements in the NPU weight layout). */
+typedef struct {
+	int in_prec, proc_prec, out_prec, in_bytes, out_bytes, kgroup, qd_en;
+	uint32_t bs_ow, cvt_scale, cvt_shift, surf_add;
+} rk_probe_cfg;
+int rk_probe_raw(rk_ctx *ctx, const rk_probe_cfg *cfg, int M, int N, int K,
+                 const void *a_rows, const void *w_bytes, void *c_rows);
+
 #ifdef __cplusplus
 }
 #endif

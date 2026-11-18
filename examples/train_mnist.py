@@ -88,7 +88,7 @@ def accuracy(model, x, y, use_npu):
 
 
 def npu_ctx(args):
-    return rt.npu_mode(conv=getattr(args, "conv", False))
+    return rt.npu_mode(conv=getattr(args, "conv", False), precision=getattr(args, "precision", "fp16"))
 
 
 def train(model, data, args, use_npu):
@@ -128,6 +128,7 @@ def main():
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--only", choices=["npu", "cpu", "both"], default="both")
     p.add_argument("--conv", action="store_true", help="also route conv2d to the NPU (im2col)")
+    p.add_argument("--precision", default="fp16", help="fp16 | fp16_out16 | bf16 | int8 | fp16x3")
     args = p.parse_args()
     torch.set_num_threads(args.threads)
     torch.manual_seed(0)

@@ -49,7 +49,13 @@ def _load():
     lib.rk_gemm_f32.argtypes = [vp, i, i, i, fp, i64, i64, fp, i64, i64, fp, i64, i]
     lib.rk_gemm_f32.restype = i
     lib.rk_get_stats.argtypes = [vp, ctypes.POINTER(RkStats)]
+    lib.rk_gemm_ex.argtypes = [vp, i, i, i, i, fp, i64, i64, fp, i64, i64, fp, i64, i]
+    lib.rk_gemm_ex.restype = i
     return lib
+
+
+# precision names -> rk_gemm_ex codes (see csrc/rknpu_gemm.h)
+PRECISIONS = {"fp16": 0, "fp16_out16": 1, "int8": 2, "fp16x3": 3, "bf16": 4}
 
 
 class NPU:
@@ -83,10 +89,12 @@ class NPU:
     def set_max_m_tile(self, m):
         self.lib.rk_set_max_m_tile(self.ctx, int(m))
 
-    def gemm_ptr(self, M, N, K, a_ptr, sa_m, sa_k, b_ptr, sb_k, sb_n, c_ptr, ldc, accumulate=False):
+    def gemm_ptr(self, M, N, K, a_ptr, sa_m, sa_k, b_ptr, sb_k, sb_n, c_ptr, ldc, accumulate=False,
+                 precision="fp16"):
+        code = PRECISIONS[precision]
         with self.lock:
-            r = self.lib.rk_gemm_f32(self.ctx, M, N, K, a_ptr, sa_m, sa_k, b_ptr, sb_k, sb_n,
-                                     c_ptr, ldc, 1 if accumulate else 0)
+            r = self.lib.rk_gemm_ex(self.ctx, code, M, N, K, a_ptr, sa_m, sa_k, b_ptr, sb_k, sb_n,
+                                    c_ptr, ldc, 1 if accumulate else 0)
             if r != 0:
                 raise RuntimeError("rknpu gemm failed: " + self.lib.rk_last_error(self.ctx).decode())
 

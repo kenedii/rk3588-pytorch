@@ -13,6 +13,25 @@ from ._lib import default_npu
 # Overridable with RKNPU_MIN_MACS; tuned from bench/bench_gemm.py on a Rock 5B.
 MIN_MACS = int(os.environ.get("RKNPU_MIN_MACS", str(8_000_000)))
 
+# Precision used for NPU GEMMs: "fp16" (default), "fp16x3" (near-fp32 accuracy, ~3x NPU work),
+# "int8" (fastest MACs, quantized: approximate), "fp16_out16" (fp16 results), "bf16" (if supported).
+_precision = os.environ.get("RKNPU_PRECISION", "fp16")
+
+
+def set_precision(name):
+    """Select the NPU GEMM precision for subsequent calls. Returns the previous one."""
+    global _precision
+    from ._lib import PRECISIONS
+    if name not in PRECISIONS:
+        raise ValueError(f"unknown precision {name!r}; choose from {sorted(PRECISIONS)}")
+    prev, _precision = _precision, name
+    return prev
+
+
+def get_precision():
+    return _precision
+
+
 _stats = {"npu_calls": 0, "cpu_calls": 0, "npu_macs": 0, "cpu_macs": 0}
 
 
@@ -37,8 +56,9 @@ def _usable(*ts):
     return True
 
 
-def mm_raw(a, b, out=None, accumulate=False):
+def mm_raw(a, b, out=None, accumulate=False, precision=None):
     """C = a @ b for 2-D CPU tensors, computed on the NPU (no autograd)."""
+    precision = precision or _precision
     assert a.dim() == 2 and b.dim() == 2 and a.shape[1] == b.shape[0], (a.shape, b.shape)
     M, K = a.shape
     N = b.shape[1]
@@ -63,7 +83,8 @@ def mm_raw(a, b, out=None, accumulate=False):
         a, b = a.contiguous(), b.contiguous()
     npu = default_npu()
     npu.gemm_ptr(M, N, K, a.data_ptr(), a.stride(0), a.stride(1),
-                 b.data_ptr(), b.stride(0), b.stride(1), out.data_ptr(), out.stride(0), accumulate)
+                 b.data_ptr(), b.stride(0), b.stride(1), out.data_ptr(), out.stride(0), accumulate,
+                 precision=precision)
     _stats["npu_calls"] += 1
     _stats["npu_macs"] += M * N * K
     return out

@@ -84,9 +84,11 @@ int ioctl(int fd, unsigned long req, ...) {
 							ent *w = by_dma(wd);
 							if (w && w->ptr) {
 								_Float16 *h = (_Float16 *)((char *)w->ptr + (wd - w->dma));
+								signed char *hb = (signed char *)((char *)w->ptr + (wd - w->dma));
 								int nd = atoi(getenv("SPY_DUMP_W"));
+								int bytes = getenv("SPY_W_BYTES") != NULL;
 								fprintf(out, "  WEIGHTS@%#x:", wd);
-								for (int q = 0; q < nd; q++) fprintf(out, "%s%d", q % 32 ? " " : "\n   ", (int)h[q]);
+								for (int q = 0; q < nd; q++) fprintf(out, "%s%d", q % 32 ? " " : "\n   ", bytes ? (int)hb[q] : (int)h[q]);
 								fprintf(out, "\n");
 							}
 							break;
