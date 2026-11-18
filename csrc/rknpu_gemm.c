@@ -1067,7 +1067,9 @@ static int gemm_engine(rk_ctx *ctx, job_t *J) {
 	int Np = round_up(N, G);
 	int nn = ceil_div(Np, ctx->max_n);
 	int Nc = round_up(ceil_div(Np, nn), G);
-	int Mp = round_up(M, 4);
+	int Mp0 = round_up(M, 4), Mp;
+relayout:
+	Mp = Mp0;
 	/* weight banks: at least one kernel group, and (like librknnrt) up to 4 banks or
 	 * whatever holds all weights; leaving a single bank for streamed weights hangs the CNA */
 	int wbanks_min = ceil_div(G * Kc * ib, CBUF_BANK_SIZE);
@@ -1089,6 +1091,13 @@ static int gemm_engine(rk_ctx *ctx, job_t *J) {
 	int dbanks = ceil_div((Mt + 1) * Kc * ib, CBUF_BANK_SIZE);
 	int wbanks = CBUF_BANKS - dbanks;
 	int weights_fit = (long)Kc * ib * Nc <= (long)wbanks * CBUF_BANK_SIZE;
+	/* Streamed weights (more than fit beside the data banks) hang the CNA for some K chunk
+	 * sizes (e.g. 2016, 3008, 4000 with N = 64) and work for multiples of 512: pad the
+	 * chunk with zeros in that case. */
+	if (!weights_fit && Kc % 512) {
+		Kc = round_up(Kc, 512);
+		goto relayout;
+	}
 	int T = nm * nk * nn;                     /* tasks per batch element */
 	int nb = J->batch > 1 ? J->batch : 1;
 	int TT = T * nb;
