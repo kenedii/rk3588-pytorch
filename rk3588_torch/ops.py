@@ -1,27 +1,58 @@
-"""NPU-backed matmul primitives with autograd support.
+"""NPU-backed matmul primitives.
 
-Every GEMM in forward and backward (y = x W^T, dX = dY W, dW = dY^T X) goes through
-the NPU. Operand transposes are passed as strides, never materialized.
+All NPU work goes through one custom op, ``torch.ops.rknpu.mm`` (2-D or batched 3-D
+a @ b), registered with ``torch.library`` so it works with autograd and torch.compile.
+Its backward is two more rknpu.mm calls (dA = dC @ B^T, dB = A^T @ dC); transposes are
+passed to the NPU as strides, never copied.
+
+Every call is guarded so that training can't be broken by the NPU:
+  * small GEMMs (below a calibrated size) run on the CPU, where they are faster;
+  * each new (shape, layout, precision) is checked against a CPU reference on a few
+    rows the first time it is seen; a mismatch pins that shape to the CPU;
+  * non-finite NPU output with finite inputs is recomputed on the CPU;
+  * NPU errors fall back to the CPU, and after repeated errors the NPU is disabled.
 """
+import math
 import os
+import threading
+import time
+import warnings
 
 import torch
 
-from ._lib import default_npu
+from ._lib import PRECISIONS, default_npu, npu_available
 
-# Below this many multiply-adds the CPU wins (submit + packing overhead dominates).
-# Overridable with RKNPU_MIN_MACS; tuned from bench/bench_gemm.py on a Rock 5B.
-MIN_MACS = int(os.environ.get("RKNPU_MIN_MACS", str(8_000_000)))
+# ---------------------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------------------
+# Below this many multiply-adds the CPU wins. None = use the calibrated value (see
+# calibrate.py) or 8e6; an integer (or RKNPU_MIN_MACS) forces a fixed threshold.
+MIN_MACS = int(os.environ["RKNPU_MIN_MACS"]) if os.environ.get("RKNPU_MIN_MACS") else None
+DEFAULT_MIN_MACS = 8_000_000
 
-# Precision used for NPU GEMMs: "fp16" (default), "fp16x3" (near-fp32 accuracy, ~3x NPU work),
-# "int8" (fastest MACs, quantized: approximate), "fp16_out16" (fp16 results), "bf16" (if supported).
+# "first" (default): verify each new shape once; "always": every call; "off".
+VERIFY = os.environ.get("RKNPU_VERIFY", "first")
+# relative error allowed when checking an NPU result against the CPU, per precision
+VERIFY_TOL = {"fp16": 5e-3, "fp16_out16": 5e-3, "bf16": 3e-2, "int8": 8e-2, "fp16x3": 1e-4}
+MAX_FAILURES = int(os.environ.get("RKNPU_MAX_FAILURES", "3"))
+
 _precision = os.environ.get("RKNPU_PRECISION", "fp16")
+if _precision not in PRECISIONS:
+    raise ValueError(f"RKNPU_PRECISION={_precision!r}; choose from {sorted(PRECISIONS)}")
+
+_enabled = os.environ.get("RKNPU_DISABLE", "0") not in ("1", "true", "yes")
+_verified = {}           # shape key -> True (ok) / False (pinned to CPU)
+_failures = 0
+_warned = set()
+_lock = threading.Lock()
+
+_stats = {"npu_calls": 0, "cpu_calls": 0, "npu_macs": 0, "cpu_macs": 0, "npu_time": 0.0, "cpu_time": 0.0,
+          "fallbacks": 0, "verified_shapes": 0, "rejected_shapes": 0}
 
 
 def set_precision(name):
     """Select the NPU GEMM precision for subsequent calls. Returns the previous one."""
     global _precision
-    from ._lib import PRECISIONS
     if name not in PRECISIONS:
         raise ValueError(f"unknown precision {name!r}; choose from {sorted(PRECISIONS)}")
     prev, _precision = _precision, name
@@ -32,19 +63,42 @@ def get_precision():
     return _precision
 
 
-_stats = {"npu_calls": 0, "cpu_calls": 0, "npu_macs": 0, "cpu_macs": 0}
+def set_enabled(flag):
+    """Turn NPU offload on/off for this process (off = everything on the CPU)."""
+    global _enabled
+    _enabled = bool(flag)
+
+
+def is_enabled():
+    return _enabled and npu_available()
 
 
 def stats(reset=False):
     out = dict(_stats)
     if reset:
         for k in _stats:
-            _stats[k] = 0
+            _stats[k] = 0.0 if isinstance(_stats[k], float) else 0
     return out
 
 
-def _as_f32(t):
-    return t if t.dtype == torch.float32 else t.float()
+def reset_verification():
+    """Forget which shapes were verified (they will be checked again on next use)."""
+    _verified.clear()
+
+
+def _warn_once(key, msg):
+    if key not in _warned:
+        _warned.add(key)
+        warnings.warn("rk3588_torch: " + msg, RuntimeWarning, stacklevel=3)
+
+
+def threshold(precision=None):
+    """Smallest GEMM (in multiply-adds) that is sent to the NPU."""
+    if MIN_MACS is not None:
+        return MIN_MACS
+    from .calibrate import cached_threshold
+    t = cached_threshold(precision or _precision)
+    return DEFAULT_MIN_MACS if t is None else t
 
 
 def _usable(*ts):
@@ -56,115 +110,230 @@ def _usable(*ts):
     return True
 
 
-def mm_raw(a, b, out=None, accumulate=False, precision=None):
-    """C = a @ b for 2-D CPU tensors, computed on the NPU (no autograd)."""
-    precision = precision or _precision
-    assert a.dim() == 2 and b.dim() == 2 and a.shape[1] == b.shape[0], (a.shape, b.shape)
-    M, K = a.shape
-    N = b.shape[1]
-    if M * N * K < MIN_MACS:
-        _stats["cpu_calls"] += 1
-        _stats["cpu_macs"] += M * N * K
-        r = _as_f32(a) @ _as_f32(b)
-        if out is None:
-            return r
-        if accumulate:
-            out += r
-        else:
-            out.copy_(r)
-        return out
-    a = _as_f32(a)
-    b = _as_f32(b)
-    if out is None:
-        out = torch.empty((M, N), dtype=torch.float32)
-        accumulate = False
-    assert out.is_contiguous() and out.dtype == torch.float32
-    if a.stride(0) == 0 or b.stride(1) == 0:
-        a, b = a.contiguous(), b.contiguous()
-    npu = default_npu()
-    npu.gemm_ptr(M, N, K, a.data_ptr(), a.stride(0), a.stride(1),
-                 b.data_ptr(), b.stride(0), b.stride(1), out.data_ptr(), out.stride(0), accumulate,
-                 precision=precision)
-    _stats["npu_calls"] += 1
-    _stats["npu_macs"] += M * N * K
+def _as_f32(t):
+    return t if t.dtype == torch.float32 else t.float()
+
+
+# ---------------------------------------------------------------------------------------
+# The guarded GEMM
+# ---------------------------------------------------------------------------------------
+def _cpu_gemm(a, b):
+    t0 = time.perf_counter()
+    out = _as_f32(a) @ _as_f32(b)
+    _stats["cpu_time"] += time.perf_counter() - t0
+    _stats["cpu_calls"] += 1
+    _stats["cpu_macs"] += out.numel() * a.shape[-1]
     return out
 
 
-class NPUMatmul(torch.autograd.Function):
-    """2-D a @ b with NPU forward and backward."""
+def _npu_gemm(a, b, precision):
+    """a: (M,K) or (B,M,K); b: (K,N) or (B,K,N); returns fp32 (M,N) / (B,M,N)."""
+    a = _as_f32(a)
+    b = _as_f32(b)
+    batched = a.dim() == 3
+    if not batched:
+        a, b = a.unsqueeze(0), b.unsqueeze(0)
+    Bt, M, K = a.shape
+    N = b.shape[2]
+    # broadcast batch (stride 0) is supported; broadcast inside a matrix is not
+    if a.stride(1) == 0 or a.stride(2) == 0:
+        a = a.contiguous()
+    if b.stride(1) == 0 or b.stride(2) == 0:
+        b = b.contiguous()
+    out = torch.empty((Bt, M, N), dtype=torch.float32)
+    t0 = time.perf_counter()
+    with torch.profiler.record_function("rknpu::gemm"):
+        default_npu().gemm(Bt, M, N, K, a.data_ptr(), a.stride(0) if Bt > 1 else 0, a.stride(1), a.stride(2),
+                           b.data_ptr(), b.stride(0) if Bt > 1 else 0, b.stride(1), b.stride(2),
+                           out.data_ptr(), M * N, N, False, precision)
+    _stats["npu_time"] += time.perf_counter() - t0
+    _stats["npu_calls"] += 1
+    _stats["npu_macs"] += Bt * M * N * K
+    return out if batched else out[0]
 
-    @staticmethod
-    def forward(ctx, a, b):
-        ctx.save_for_backward(a, b)
-        return mm_raw(a.detach(), b.detach()).to(torch.promote_types(a.dtype, b.dtype))
 
-    @staticmethod
-    def backward(ctx, g):
-        a, b = ctx.saved_tensors
-        ga = gb = None
-        g = g.detach()
-        if ctx.needs_input_grad[0]:
-            ga = mm_raw(g, b.detach().t()).to(a.dtype)       # dA = dC @ B^T
-        if ctx.needs_input_grad[1]:
-            gb = mm_raw(a.detach().t(), g).to(b.dtype)       # dB = A^T @ dC
-        return ga, gb
+def _check_sample(a, b, out, precision):
+    """Compare a few rows of the NPU result with an fp64 CPU reference."""
+    if a.dim() == 3:
+        a, b, out = a[0], b[0] if b.dim() == 3 else b, out[0]
+    M = a.shape[0]
+    idx = torch.unique(torch.linspace(0, M - 1, min(8, M)).round().long())
+    ref = a[idx].double() @ b.double()
+    den = ref.norm().item()
+    if den == 0.0 or not math.isfinite(den):
+        return True
+    err = (out[idx].double() - ref).norm().item() / den
+    return err <= VERIFY_TOL[precision]
 
 
-class NPULinearFn(torch.autograd.Function):
-    """y = x @ W^T + bias, x is (M, K), W is (N, K)."""
+def gemm(a, b, precision=None):
+    """Guarded a @ b (2-D, or 3-D batched with equal batch), fp32 result."""
+    global _failures, _enabled
+    precision = precision or _precision
+    macs = a.numel() // a.shape[-1] * b.shape[-1] * a.shape[-1] if a.dim() == 2 else \
+        a.shape[0] * a.shape[1] * b.shape[-1] * a.shape[2]
+    if not _enabled or macs < threshold(precision) or not _usable(a, b) or not npu_available():
+        return _cpu_gemm(a, b)
+    key = (a.dim(), tuple(a.shape), tuple(b.shape), precision, a.stride(-1) == 1, b.stride(-1) == 1)
+    status = _verified.get(key)
+    if status is False:
+        return _cpu_gemm(a, b)
+    try:
+        out = _npu_gemm(a, b, precision)
+    except (RuntimeError, OSError) as e:
+        with _lock:
+            _failures += 1
+            _stats["fallbacks"] += 1
+            if _failures >= MAX_FAILURES:
+                _enabled = False
+                _warn_once("disabled", f"NPU failed {_failures} times (last: {e}); continuing on the CPU only")
+            else:
+                _warn_once("fail", f"NPU GEMM failed ({e}); this call ran on the CPU")
+        return _cpu_gemm(a, b)
+    if not torch.isfinite(out).all():
+        if torch.isfinite(a).all() and torch.isfinite(b).all():
+            _verified[key] = False
+            _stats["rejected_shapes"] += 1
+            _stats["fallbacks"] += 1
+            _warn_once(("nonfinite", key), f"non-finite NPU output for shape {key[1]}x{key[2]} ({precision}); "
+                                           "using the CPU for it")
+            return _cpu_gemm(a, b)
+        return out   # garbage in, garbage out: same as the CPU would give
+    if VERIFY == "always" or (VERIFY == "first" and status is None):
+        ok = _check_sample(a, b, out, precision)
+        _verified[key] = ok
+        if ok:
+            _stats["verified_shapes"] += 1
+        else:
+            _stats["rejected_shapes"] += 1
+            _stats["fallbacks"] += 1
+            _warn_once(("mismatch", key), f"NPU result for shape {key[1]}x{key[2]} ({precision}) didn't match "
+                                          "the CPU check; using the CPU for that shape")
+            return _cpu_gemm(a, b)
+    return out
 
-    @staticmethod
-    def forward(ctx, x, weight, bias):
-        ctx.save_for_backward(x, weight)
-        ctx.has_bias = bias is not None
-        y = mm_raw(x.detach(), weight.detach().t())
-        if bias is not None:
-            y += bias.detach().float()
-        return y.to(x.dtype)
 
-    @staticmethod
-    def backward(ctx, g):
-        x, w = ctx.saved_tensors
-        g = g.detach().contiguous()
-        gx = gw = gb = None
-        if ctx.needs_input_grad[0]:
-            gx = mm_raw(g, w.detach()).to(x.dtype)            # dX = dY @ W
-        if ctx.needs_input_grad[1]:
-            gw = mm_raw(g.t(), x.detach()).to(w.dtype)        # dW = dY^T @ X
-        if ctx.has_bias and ctx.needs_input_grad[2]:
-            gb = g.sum(0).to(w.dtype)
-        return gx, gw, gb
+# ---------------------------------------------------------------------------------------
+# torch.library custom op: torch.ops.rknpu.mm(a, b, precision)
+# ---------------------------------------------------------------------------------------
+@torch.library.custom_op("rknpu::mm", mutates_args=())
+def _rknpu_mm(a: torch.Tensor, b: torch.Tensor, precision: str) -> torch.Tensor:
+    return gemm(a, b, precision)
+
+
+@_rknpu_mm.register_fake
+def _(a, b, precision):
+    return a.new_empty((*a.shape[:-1], b.shape[-1]), dtype=torch.float32)
+
+
+def _mm_setup(ctx, inputs, output):
+    a, b, precision = inputs
+    ctx.save_for_backward(a, b)
+    ctx.precision = precision
+
+
+def _mm_backward(ctx, g):
+    a, b = ctx.saved_tensors
+    ga = gb = None
+    if ctx.needs_input_grad[0]:
+        ga = torch.ops.rknpu.mm(g, b.transpose(-1, -2), ctx.precision).to(a.dtype)   # dA = dC @ B^T
+    if ctx.needs_input_grad[1]:
+        gb = torch.ops.rknpu.mm(a.transpose(-1, -2), g, ctx.precision).to(b.dtype)   # dB = A^T @ dC
+    return ga, gb, None
+
+
+_rknpu_mm.register_autograd(_mm_backward, setup_context=_mm_setup)
+
+
+def _out_dtype(*ts):
+    dt = ts[0].dtype
+    for t in ts[1:]:
+        dt = torch.promote_types(dt, t.dtype)
+    return dt
+
+
+# ---------------------------------------------------------------------------------------
+# PyTorch-shaped wrappers
+# ---------------------------------------------------------------------------------------
+def mm_raw(a, b, out=None, accumulate=False, precision=None):
+    """C = a @ b for 2-D CPU tensors, guarded, no autograd (kept for tests/benchmarks)."""
+    r = gemm(a.detach(), b.detach(), precision)
+    if out is None:
+        return r
+    if accumulate:
+        out += r
+    else:
+        out.copy_(r)
+    return out
 
 
 def matmul2d(a, b):
-    return NPUMatmul.apply(a, b)
+    return torch.ops.rknpu.mm(a, b, _precision).to(_out_dtype(a, b))
 
 
 def linear(x, weight, bias=None):
     shape = x.shape
-    x2 = x.reshape(-1, shape[-1])
-    y = NPULinearFn.apply(x2, weight, bias)
+    y = torch.ops.rknpu.mm(x.reshape(-1, shape[-1]), weight.t(), _precision).to(_out_dtype(x, weight))
+    if bias is not None:
+        y = y + bias
     return y.reshape(*shape[:-1], weight.shape[0])
 
 
 def bmm(a, b):
-    # one GEMM per batch element; the NPU context serializes them anyway
-    return torch.stack([NPUMatmul.apply(a[i], b[i]) for i in range(a.shape[0])])
+    """Batched matmul: all batch elements go to the NPU in one submission."""
+    return torch.ops.rknpu.mm(a, b, _precision).to(_out_dtype(a, b))
 
 
 def matmul(a, b):
     """torch.matmul semantics for the common cases; returns None if unsupported."""
     if a.dim() == 2 and b.dim() == 2:
-        return NPUMatmul.apply(a, b)
+        return matmul2d(a, b)
     if a.dim() >= 3 and b.dim() == 2:
         lead = a.shape[:-1]
-        return NPUMatmul.apply(a.reshape(-1, a.shape[-1]), b).reshape(*lead, b.shape[-1])
+        return matmul2d(a.reshape(-1, a.shape[-1]), b).reshape(*lead, b.shape[-1])
     if a.dim() >= 3 and b.dim() >= 3 and a.shape[:-2] == b.shape[:-2]:
         lead = a.shape[:-2]
         a3 = a.reshape(-1, *a.shape[-2:])
         b3 = b.reshape(-1, *b.shape[-2:])
         return bmm(a3, b3).reshape(*lead, a.shape[-2], b.shape[-1])
     return None
+
+
+def baddbmm(inp, b1, b2, beta=1, alpha=1):
+    y = bmm(b1, b2)
+    if alpha != 1:
+        y = y * alpha
+    if beta == 0:
+        return y
+    return y + (inp if beta == 1 else inp * beta)
+
+
+def scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None,
+                                 enable_gqa=False):
+    """SDPA as two batched NPU matmuls around a CPU softmax. Returns None if unsupported."""
+    if enable_gqa or q.dim() < 3 or q.shape[:-2] != k.shape[:-2] or k.shape[:-2] != v.shape[:-2]:
+        return None
+    lead = q.shape[:-2]
+    L, E = q.shape[-2:]
+    S, Ev = v.shape[-2:]
+    q3 = q.reshape(-1, L, E)
+    k3 = k.reshape(-1, S, E)
+    v3 = v.reshape(-1, S, Ev)
+    sc = scale if scale is not None else 1.0 / math.sqrt(E)
+    scores = bmm(q3, k3.transpose(1, 2)) * sc                                       # (B, L, S)
+    if is_causal:
+        causal = torch.ones(L, S, dtype=torch.bool).tril(diagonal=S - L)
+        scores = scores.masked_fill(~causal, float("-inf"))
+    if attn_mask is not None:
+        m = attn_mask
+        if m.dim() > 2:
+            m = m.expand(*lead, L, S).reshape(-1, L, S)
+        scores = scores.masked_fill(~m, float("-inf")) if m.dtype == torch.bool else scores + m
+    attn = torch.softmax(scores, dim=-1)
+    if dropout_p > 0.0:
+        attn = torch.nn.functional.dropout(attn, p=dropout_p)
+    out = bmm(attn.to(v.dtype), v3)                                                 # (B, L, Ev)
+    return out.reshape(*lead, L, Ev)
 
 
 def conv2d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
@@ -182,3 +351,9 @@ def conv2d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
     cols = cols.transpose(1, 2).reshape(B * oh * ow, C * kh * kw)
     y = linear(cols, weight.reshape(O, -1), bias)                                     # B*L, O
     return y.reshape(B, oh * ow, O).transpose(1, 2).reshape(B, O, oh, ow)
+
+
+def release():
+    """Free the NPU's DMA buffers (they are re-created on demand)."""
+    if npu_available():
+        default_npu().release()

@@ -11,3 +11,6 @@ CLAUDE.md
 !README.md
 jobs/
 logs/
+build/
+dist/
+*.egg-info/

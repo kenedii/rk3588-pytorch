@@ -8,6 +8,7 @@
 #ifndef RKNPU_GEMM_H
 #define RKNPU_GEMM_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -38,7 +39,8 @@ const char *rk_last_error(rk_ctx *ctx);
  *                 2 = chained, split across the three NPU cores. */
 void rk_set_mode(rk_ctx *ctx, int mode);
 void rk_set_threads(rk_ctx *ctx, int threads);   /* CPU threads for packing (default 3) */
-void rk_set_max_m_tile(rk_ctx *ctx, int m);      /* rows of A per NPU task (default 256) */
+void rk_set_max_m_tile(rk_ctx *ctx, int m);      /* rows of A per NPU task (default 1020) */
+void rk_set_max_buf_mb(rk_ctx *ctx, int mb);     /* cap NPU buffers per call; bigger GEMMs are split */
 
 /*
  * C = A @ B (or C += A @ B if accumulate).
@@ -65,6 +67,25 @@ int rk_gemm_ex(rk_ctx *ctx, int prec, int M, int N, int K,
                const float *B, int64_t sb_k, int64_t sb_n,
                float *C, int64_t ldc, int accumulate);
 
+/* Batched: C[b] = A[b] @ B[b] for b < batch; batch strides in elements (0 = shared operand).
+ * All batch elements go to the NPU as one chain of tasks. */
+int rk_gemm_batched(rk_ctx *ctx, int prec, int batch, int M, int N, int K,
+                    const float *A, int64_t sa_b, int64_t sa_m, int64_t sa_k,
+                    const float *B, int64_t sb_b, int64_t sb_k, int64_t sb_n,
+                    float *C, int64_t sc_b, int64_t ldc, int accumulate);
+
+/* Free all NPU buffers (they are re-created on demand) / bytes currently held. */
+void   rk_release(rk_ctx *ctx);
+size_t rk_buffer_bytes(rk_ctx *ctx);
+
+typedef struct {
+	int driver_version;     /* e.g. 908 = 0.9.8 */
+	uint32_t hw_version;
+	int iommu;
+	uint32_t freq_hz;
+} rk_info;
+int rk_query(rk_ctx *ctx, rk_info *info);
+
 /* Hardware probing: one task, raw bytes, caller-chosen precision codes (M%4==0, K%32==0, N%16==0;
  * a_rows is M x K row-major, w_bytes is N*K elements in the NPU weight layout). */
 typedef struct {
@@ -73,6 +94,13 @@ typedef struct {
 } rk_probe_cfg;
 int rk_probe_raw(rk_ctx *ctx, const rk_probe_cfg *cfg, int M, int N, int K,
                  const void *a_rows, const void *w_bytes, void *c_rows);
+
+/* Raw single-task convolution (fp16 NHWC in, fp32 NHWC out) for probing. */
+typedef struct {
+	int h, w, c, n, kh, kw, sy, sx, pt, pl, oh, ow;
+	int grains, dbanks;     /* 0 = defaults */
+} rk_conv_cfg;
+int rk_conv_raw(rk_ctx *ctx, const rk_conv_cfg *cfg, const void *in_nhwc, const void *w_bytes, void *out_nhwc);
 
 #ifdef __cplusplus
 }

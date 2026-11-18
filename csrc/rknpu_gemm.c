@@ -32,6 +32,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/file.h>
 
 #include "npu_regs.h"
 #include "rknpu_gemm.h"
@@ -68,6 +69,8 @@ struct rk_ctx {
 	int      reuse;
 	struct pool *pool;
 	int      autoscale;
+	int      lock_fd;          /* cross-process lock (flock) or -1 */
+	size_t   max_buf;          /* cap on NPU buffer bytes per call; larger GEMMs are split */
 	float   *scr[3];
 	size_t   scr_n[3];
 	rk_buf   regcmd, tasks, a, b, c;
@@ -130,6 +133,12 @@ rk_ctx *rk_open(const char *dev) {
 	ctx->timeout_ms = env_int("RKNPU_TIMEOUT_MS", 3000);
 	ctx->reuse = env_int("RKNPU_WEIGHT_REUSE", 1);
 	ctx->autoscale = env_int("RKNPU_AUTOSCALE", 1);
+	ctx->max_buf = (size_t)env_int("RKNPU_MAX_BUF_MB", 512) << 20;
+	ctx->lock_fd = -1;
+	if (env_int("RKNPU_LOCK", 1)) {
+		const char *lp = getenv("RKNPU_LOCK_FILE") ? getenv("RKNPU_LOCK_FILE") : "/tmp/rk3588_torch.lock";
+		ctx->lock_fd = open(lp, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+	}
 
 	return ctx;
 }
@@ -152,6 +161,7 @@ void rk_close(rk_ctx *ctx) {
 	buf_free(ctx, &ctx->c);
 	pool_destroy(ctx->pool);
 	for (int i = 0; i < 3; i++) free(ctx->scr[i]);
+	if (ctx->lock_fd >= 0) close(ctx->lock_fd);
 	close(ctx->fd);
 	free(ctx);
 }
@@ -159,7 +169,42 @@ void rk_close(rk_ctx *ctx) {
 void rk_set_mode(rk_ctx *ctx, int mode) { ctx->mode = mode; }
 void rk_set_threads(rk_ctx *ctx, int t) { ctx->threads = t > 0 ? t : 1; }
 void rk_set_max_m_tile(rk_ctx *ctx, int m) { ctx->max_m = m >= 4 ? m & ~3 : 4; }
+void rk_set_max_buf_mb(rk_ctx *ctx, int mb) { ctx->max_buf = (size_t)(mb > 1 ? mb : 1) << 20; }
 void rk_get_stats(rk_ctx *ctx, rk_stats *out) { *out = ctx->stats; }
+
+/* Serialize NPU submissions between processes using this library (the driver queues jobs
+ * anyway; this keeps one process's task chains from interleaving with another's). */
+static void npu_lock(rk_ctx *ctx) { if (ctx->lock_fd >= 0) flock(ctx->lock_fd, LOCK_EX); }
+static void npu_unlock(rk_ctx *ctx) { if (ctx->lock_fd >= 0) flock(ctx->lock_fd, LOCK_UN); }
+
+static void buf_free(rk_ctx *ctx, rk_buf *b);
+
+void rk_release(rk_ctx *ctx) {
+	buf_free(ctx, &ctx->regcmd);
+	buf_free(ctx, &ctx->tasks);
+	buf_free(ctx, &ctx->a);
+	buf_free(ctx, &ctx->b);
+	buf_free(ctx, &ctx->c);
+	for (int i = 0; i < 3; i++) { free(ctx->scr[i]); ctx->scr[i] = NULL; ctx->scr_n[i] = 0; }
+}
+
+size_t rk_buffer_bytes(rk_ctx *ctx) {
+	return ctx->a.size + ctx->b.size + ctx->c.size + ctx->regcmd.size + ctx->tasks.size;
+}
+
+int rk_query(rk_ctx *ctx, rk_info *info) {
+	memset(info, 0, sizeof(*info));
+	struct rknpu_action a;
+	a.flags = RKNPU_GET_DRV_VERSION; a.value = 0;
+	if (ioctl(ctx->fd, DRM_IOCTL_RKNPU_ACTION, &a) == 0) info->driver_version = (int)a.value;
+	a.flags = RKNPU_GET_HW_VERSION; a.value = 0;
+	if (ioctl(ctx->fd, DRM_IOCTL_RKNPU_ACTION, &a) == 0) info->hw_version = a.value;
+	a.flags = RKNPU_GET_IOMMU_EN; a.value = 0;
+	if (ioctl(ctx->fd, DRM_IOCTL_RKNPU_ACTION, &a) == 0) info->iommu = (int)a.value;
+	a.flags = RKNPU_GET_FREQ; a.value = 0;
+	if (ioctl(ctx->fd, DRM_IOCTL_RKNPU_ACTION, &a) == 0) info->freq_hz = a.value;
+	return 0;
+}
 
 /* Grow-only buffer, cacheable, mapped on all NPU cores. */
 static int buf_ensure(rk_ctx *ctx, rk_buf *b, size_t size, uint32_t flags) {
@@ -239,13 +284,21 @@ typedef struct {
 	int dbanks, wbanks;     /* CBUF split */
 	int reuse;              /* weights already resident from the previous task */
 	uint32_t in_dma, w_dma, out_dma, next_dma;
+	/* convolution geometry (all zero = matmul: width 1, height m, 1x1 kernel) */
+	int in_w, in_h, out_w, out_h, kw, kh, sx, sy, pl, pt;
 } task_desc;
 
 /* Register stream for one row-major matmul task (precisions from t->dt). */
 static void emit_task(uint64_t *o, const task_desc *t) {
 	const dtype_t *dt = t->dt;
 	const uint32_t m = t->m, k = t->k, n = t->n;
-	const uint32_t kb = k * (uint32_t)dt->in_bytes;                   /* bytes per row / kernel */
+	const uint32_t kb = k * (uint32_t)dt->in_bytes;                   /* bytes per pixel (all channels) */
+	const int conv = t->kw > 0;
+	const uint32_t iw = conv ? (uint32_t)t->in_w : 1, ih = conv ? (uint32_t)t->in_h : m;
+	const uint32_t ow = conv ? (uint32_t)t->out_w : 1, oh = conv ? (uint32_t)t->out_h : m;
+	const uint32_t kw = conv ? (uint32_t)t->kw : 1, kh = conv ? (uint32_t)t->kh : 1;
+	const uint32_t sx = conv ? (uint32_t)t->sx : 1, sy = conv ? (uint32_t)t->sy : 1;
+	const uint32_t pl = conv ? (uint32_t)t->pl : 0, pt = conv ? (uint32_t)t->pt : 0;
 	const uint32_t notch = n * (uint32_t)dt->out_bytes / 16 - 1;      /* 16-byte output atoms per row - 1 */
 	const uint32_t cbuf = (t->reuse ? CBUF_WEIGHT_REUSE : 0) | ((uint32_t)t->wbanks << 4) | (uint32_t)t->dbanks;
 	/* bit 29: row-major feature input */
@@ -259,16 +312,16 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_DPU, DPU_S_POINTER, 0xE);
 	R(OP_REG_CNA, CNA_CONV_CON1, conv1);
 	R(OP_REG_CNA, CNA_CONV_CON2, ((uint32_t)t->grains & 0x3FF) << 4);
-	R(OP_REG_CNA, CNA_CONV_CON3, (1 << 3) | 1);
-	R(OP_REG_CNA, CNA_DATA_SIZE0, (1u << 16) | (m & 0x7FF));
+	R(OP_REG_CNA, CNA_CONV_CON3, ((sy & 7) << 3) | (sx & 7));
+	R(OP_REG_CNA, CNA_DATA_SIZE0, ((iw & 0x7FF) << 16) | (ih & 0x7FF));
 	R(OP_REG_CNA, CNA_DATA_SIZE1, ((k - 1) << 16) | k);
-	R(OP_REG_CNA, CNA_DATA_SIZE2, 1);
-	R(OP_REG_CNA, CNA_DATA_SIZE3, m & 0x3FFFF);
-	R(OP_REG_CNA, CNA_WEIGHT_SIZE0, kb * n);
-	R(OP_REG_CNA, CNA_WEIGHT_SIZE1, kb & 0x7FFFF);
-	R(OP_REG_CNA, CNA_WEIGHT_SIZE2, (1u << 24) | (1u << 16) | (n & 0x3FFF));
+	R(OP_REG_CNA, CNA_DATA_SIZE2, ow & 0x7FF);
+	R(OP_REG_CNA, CNA_DATA_SIZE3, (ow * oh) & 0x3FFFF);
+	R(OP_REG_CNA, CNA_WEIGHT_SIZE0, kb * kw * kh * n);
+	R(OP_REG_CNA, CNA_WEIGHT_SIZE1, (kb * kw * kh) & 0x7FFFF);
+	R(OP_REG_CNA, CNA_WEIGHT_SIZE2, ((kw & 0x1F) << 24) | ((kh & 0x1F) << 16) | (n & 0x3FFF));
 	R(OP_REG_CNA, CNA_CBUF_CON0, cbuf);
-	R(OP_REG_CNA, CNA_CBUF_CON1, ((kb + 63) / 64) & 0x1FFF);
+	R(OP_REG_CNA, CNA_CBUF_CON1, ((iw * kb + 63) / 64) & 0x1FFF);
 	R(OP_REG_CNA, CNA_CVT_CON0, (1 << 3) | (1 << 1) | 1);
 	R(OP_REG_CNA, CNA_CVT_CON1, 1u << 16);
 	R(OP_REG_CNA, CNA_CVT_CON2, 1u << 16);
@@ -276,13 +329,13 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_CNA, CNA_CVT_CON4, 1u << 16);
 	R(OP_REG_CNA, CNA_FC_CON0, 0);
 	R(OP_REG_CNA, CNA_FC_CON1, 0);
-	R(OP_REG_CNA, CNA_PAD_CON0, 0);
+	R(OP_REG_CNA, CNA_PAD_CON0, ((pl & 0xF) << 4) | (pt & 0xF));
 	R(OP_REG_CNA, CNA_FEATURE_DATA_ADDR, t->in_dma);
 	R(OP_REG_CNA, CNA_FC_CON2, 0);
 	R(OP_REG_CNA, CNA_DMA_CON0, (15u << 16) | 15u);
-	R(OP_REG_CNA, CNA_DMA_CON1, kb / 16);        /* line stride: one row of A, in 16-byte units */
+	R(OP_REG_CNA, CNA_DMA_CON1, iw * kb / 16);   /* line stride: one row (iw pixels), 16-byte units */
 	R(OP_REG_CNA, CNA_DMA_CON2, 0);              /* surface stride: channel groups are contiguous */
-	R(OP_REG_CNA, CNA_FC_DATA_SIZE0, (1u << 16) | (m & 0x7FF));
+	R(OP_REG_CNA, CNA_FC_DATA_SIZE0, ((iw & 0x7FF) << 16) | (ih & 0x7FF));
 	R(OP_REG_CNA, CNA_FC_DATA_SIZE1, k & 0xFFFF);
 	R(OP_REG_CNA, CNA_DCOMP_CTRL, 0);
 	R(OP_REG_CNA, CNA_DCOMP_REGNUM, 0);
@@ -292,7 +345,7 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_CNA, CNA_PAD_CON1, 0);
 
 	R(OP_REG_CORE, CORE_MISC_CFG, ((uint32_t)dt->proc_prec << 8) | (uint32_t)dt->qd_en);
-	R(OP_REG_CORE, CORE_DATAOUT_SIZE_0, (m - 1) << 16);
+	R(OP_REG_CORE, CORE_DATAOUT_SIZE_0, ((oh - 1) << 16) | (ow - 1));
 	R(OP_REG_CORE, CORE_DATAOUT_SIZE_1, n - 1);
 	R(OP_REG_CORE, CORE_CLIP_TRUNCATE, 0);
 	R(OP_REG_CORE, CORE_3030, 0);
@@ -302,8 +355,8 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_DPU, DPU_OFFSET_PEND, 0);
 	R(OP_REG_DPU, DPU_DST_BASE_ADD, t->out_dma);
 	R(OP_REG_DPU, DPU_DST_SURF_STRIDE, 1u << 4);  /* row-major output: 4-float atoms are adjacent */
-	R(OP_REG_DPU, DPU_DATA_CUBE_WIDTH, 0);
-	R(OP_REG_DPU, DPU_DATA_CUBE_HEIGHT, (m - 1) & 0x1FFF);
+	R(OP_REG_DPU, DPU_DATA_CUBE_WIDTH, (ow - 1) & 0x1FFF);
+	R(OP_REG_DPU, DPU_DATA_CUBE_HEIGHT, (oh - 1) & 0x1FFF);
 	R(OP_REG_DPU, DPU_DATA_CUBE_NOTCH_ADDR, (notch << 16) | notch);
 	R(OP_REG_DPU, DPU_DATA_CUBE_CHANNEL, ((n - 1) << 16) | (n - 1));
 	R(OP_REG_DPU, DPU_BS_CFG, (1 << 6) | (1 << 4) | (1 << 1) | 1);
@@ -313,7 +366,7 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 	R(OP_REG_DPU, DPU_BS_OW_CFG, dt->bs_ow);
 	R(OP_REG_DPU, DPU_BS_OW_OP, 0);
 	R(OP_REG_DPU, DPU_WDMA_SIZE_0, (n - 1) & 0x1FFF);
-	R(OP_REG_DPU, DPU_WDMA_SIZE_1, ((m - 1) & 0x1FFF) << 16);
+	R(OP_REG_DPU, DPU_WDMA_SIZE_1, (((oh - 1) & 0x1FFF) << 16) | ((ow - 1) & 0x1FFF));
 	R(OP_REG_DPU, DPU_BN_CFG, (1 << 6) | (1 << 4) | (1 << 1) | 1);
 	R(OP_REG_DPU, DPU_BN_ALU_CFG, 0);
 	R(OP_REG_DPU, DPU_BN_MUL_CFG, 0);
@@ -545,6 +598,10 @@ typedef struct {
 	int accumulate;
 	float out_mul;                        /* applied to every output (undo input scales) */
 	float *amax_part;                     /* scratch for max-abs reductions */
+	int part_stride;                      /* amax_part elements per batch */
+	int batch;                            /* independent GEMMs sharing one shape */
+	int64_t sa_b, sb_b, sc_b;             /* batch strides of A, B, C (elements) */
+	size_t a_bat, b_bat, c_bat;           /* NPU buffer elements per batch */
 } job_t;
 
 /* write one converted element of A row m / B column n */
@@ -816,7 +873,46 @@ static float pow2_scale(float amax) {
 }
 
 /* ------------------------------------------------------------------------------------
- * Engine: one tiled, chained, multi-core NPU matmul
+ * Batching: every range function sees a per-batch view of the job
+ * ---------------------------------------------------------------------------------- */
+static void job_at_batch(const job_t *J, job_t *L, int bb) {
+	*L = *J;
+	if (bb == 0) return;
+	int ib = J->dt ? J->dt->in_bytes : 2, ob = J->dt ? J->dt->out_bytes : 4;
+	if (L->A) L->A += bb * J->sa_b;
+	if (L->B) L->B += bb * J->sb_b;
+	if (L->C) L->C += bb * J->sc_b;
+	if (L->ap) L->ap = (char *)L->ap + (size_t)bb * J->a_bat * ib;
+	if (L->bp) L->bp = (char *)L->bp + (size_t)bb * J->b_bat * ib;
+	if (L->cp) L->cp = (char *)L->cp + (size_t)bb * J->c_bat * ob;
+	if (L->a_row) L->a_row += (size_t)bb * J->M;
+	if (L->b_col) L->b_col += (size_t)bb * J->N;
+	if (L->b_inv) L->b_inv += (size_t)bb * J->N;
+	if (L->amax_part) L->amax_part += (size_t)bb * J->part_stride;
+}
+
+typedef struct { job_t *J; range_fn fn; int per; } bwrap;
+
+static void batched_range(void *v, int b, int e) {
+	bwrap *W = v;
+	for (int it = b; it < e;) {
+		int bb = it / W->per, lo = it % W->per;
+		int hi = (W->per - lo) < (e - it) ? W->per : lo + (e - it);
+		job_t L;
+		job_at_batch(W->J, &L, bb);
+		W->fn(&L, lo, hi);
+		it += hi - lo;
+	}
+}
+
+static void pfor_batched(rk_ctx *ctx, job_t *J, int per, int grain, range_fn fn) {
+	if (J->batch <= 1) { parallel_for(ctx, per, grain, fn, J); return; }
+	bwrap W = { J, fn, per };
+	parallel_for(ctx, per * J->batch, grain, batched_range, &W);
+}
+
+/* ------------------------------------------------------------------------------------
+ * Engine: one tiled, chained, multi-core NPU matmul (or a batch of same-shape ones)
  * ---------------------------------------------------------------------------------- */
 static int gemm_engine(rk_ctx *ctx, job_t *J) {
 	const dtype_t *dt = J->dt;
@@ -851,18 +947,21 @@ static int gemm_engine(rk_ctx *ctx, job_t *J) {
 	int dbanks = ceil_div((Mt + 1) * Kc * ib, CBUF_BANK_SIZE);
 	int wbanks = CBUF_BANKS - dbanks;
 	int weights_fit = (long)Kc * ib * Nc <= (long)wbanks * CBUF_BANK_SIZE;
-	int T = nm * nk * nn;
+	int T = nm * nk * nn;                     /* tasks per batch element */
+	int nb = J->batch > 1 ? J->batch : 1;
+	int TT = T * nb;
 	ctx->stats.m_tile = Mt; ctx->stats.k_tile = Kc; ctx->stats.n_tile = Nc;
-	ctx->stats.tasks += T;
+	ctx->stats.tasks += TT;
 
 	size_t a_chunk = (size_t)Mp * Kc, b_tile = (size_t)Nc * Kc, c_tile = (size_t)Mp * Nc;
-	size_t a_bytes = a_chunk * nk * ib, b_bytes = b_tile * nk * nn * ib, c_bytes = c_tile * nk * nn * ob;
+	J->a_bat = a_chunk * nk; J->b_bat = b_tile * nk * nn; J->c_bat = c_tile * nk * nn;
+	size_t a_bytes = J->a_bat * nb * ib, b_bytes = J->b_bat * nb * ib, c_bytes = J->c_bat * nb * ob;
 	uint32_t dflags = MEM_FLAG_400 | RKNPU_MEM_CACHEABLE | RKNPU_MEM_NON_CONTIGUOUS;
 	if (buf_ensure(ctx, &ctx->a, a_bytes, dflags) ||
 	    buf_ensure(ctx, &ctx->b, b_bytes, dflags) ||
 	    buf_ensure(ctx, &ctx->c, c_bytes, dflags) ||
-	    buf_ensure(ctx, &ctx->regcmd, (size_t)T * REGCMD_SLOTS * 8, dflags) ||
-	    buf_ensure(ctx, &ctx->tasks, (size_t)T * sizeof(struct rknpu_task), dflags | RKNPU_MEM_KERNEL_MAPPING))
+	    buf_ensure(ctx, &ctx->regcmd, (size_t)TT * REGCMD_SLOTS * 8, dflags) ||
+	    buf_ensure(ctx, &ctx->tasks, (size_t)TT * sizeof(struct rknpu_task), dflags | RKNPU_MEM_KERNEL_MAPPING))
 		return -1;
 
 	J->Mp = Mp; J->Kc = Kc; J->Nc = Nc; J->nk = nk; J->nn = nn;
@@ -871,13 +970,13 @@ static int gemm_engine(rk_ctx *ctx, job_t *J) {
 	J->nblk = ceil_div(Mp, 16);
 
 	double t0 = now_us();
-	if (J->A) parallel_for(ctx, nk * J->nblk, 4, pack_a_range, J);
+	if (J->A) pfor_batched(ctx, J, nk * J->nblk, 4, pack_a_range);
 	if (J->B) {
 		range_fn pb = pack_b_range;
 		if (J->cv == CV_F16 && G == 16) pb = pack_b_f16_range;
 		else if (J->cv == CV_BF16 && G == 16) pb = pack_b_bf16_range;
 		else if (J->cv == CV_I8 && G == 32) pb = pack_b_i8_range;
-		parallel_for(ctx, nk * nn * (Nc / G), 1, pb, J);
+		pfor_batched(ctx, J, nk * nn * (Nc / G), 1, pb);
 	}
 	ctx->stats.pack_us += now_us() - t0;
 	buf_sync(ctx, &ctx->a, a_bytes, RKNPU_MEM_SYNC_TO_DEVICE);
@@ -888,10 +987,11 @@ static int gemm_engine(rk_ctx *ctx, job_t *J) {
 	struct rknpu_task *tk = ctx->tasks.ptr;
 	int cores = ctx->mode == 2 ? 3 : 1;
 	int per_submit = ctx->mode == 0 ? 1 : PC_TASK_LIMIT;
-	for (int t = 0; t < T; t++) {
-		int i = t % nm, jc = t / nm, j = jc / nn;
+	for (int t = 0; t < TT; t++) {
+		int bb = t / T, tl = t % T;
+		int i = tl % nm, jc = tl / nm, j = jc / nn;
 		int sub_start = (t / per_submit) * per_submit;
-		int sub_count = T - sub_start < per_submit ? T - sub_start : per_submit;
+		int sub_count = TT - sub_start < per_submit ? TT - sub_start : per_submit;
 		int first = 0, last = 0;
 		if (ctx->mode == 0) first = last = 1;
 		else if (cores == 1 || sub_count < 3) { first = t == sub_start; last = t == sub_start + sub_count - 1; }
@@ -907,9 +1007,9 @@ static int gemm_engine(rk_ctx *ctx, job_t *J) {
 		task_desc d = {
 			.dt = dt, .m = Mt, .k = Kc, .n = Nc, .grains = Mt + 1, .dbanks = dbanks, .wbanks = wbanks,
 			.reuse = ctx->reuse && weights_fit && !first && i > 0,
-			.in_dma = (uint32_t)(ctx->a.dma + ((size_t)j * a_chunk + (size_t)i * Mt * Kc) * ib),
-			.w_dma = (uint32_t)(ctx->b.dma + (size_t)jc * b_tile * ib),
-			.out_dma = (uint32_t)(ctx->c.dma + ((size_t)jc * c_tile + (size_t)i * Mt * Nc) * ob),
+			.in_dma = (uint32_t)(ctx->a.dma + ((size_t)bb * J->a_bat + (size_t)j * a_chunk + (size_t)i * Mt * Kc) * ib),
+			.w_dma = (uint32_t)(ctx->b.dma + ((size_t)bb * J->b_bat + (size_t)jc * b_tile) * ib),
+			.out_dma = (uint32_t)(ctx->c.dma + ((size_t)bb * J->c_bat + (size_t)jc * c_tile + (size_t)i * Mt * Nc) * ob),
 			.next_dma = last ? 0 : (uint32_t)(ctx->regcmd.dma + (size_t)(t + 1) * REGCMD_SLOTS * 8),
 		};
 		emit_task(rc + (size_t)t * REGCMD_SLOTS, &d);
@@ -920,18 +1020,20 @@ static int gemm_engine(rk_ctx *ctx, job_t *J) {
 		};
 		tk[t] = td;
 	}
-	buf_sync(ctx, &ctx->regcmd, (size_t)T * REGCMD_SLOTS * 8, RKNPU_MEM_SYNC_TO_DEVICE);
-	buf_sync(ctx, &ctx->tasks, (size_t)T * sizeof(struct rknpu_task), RKNPU_MEM_SYNC_TO_DEVICE);
+	buf_sync(ctx, &ctx->regcmd, (size_t)TT * REGCMD_SLOTS * 8, RKNPU_MEM_SYNC_TO_DEVICE);
+	buf_sync(ctx, &ctx->tasks, (size_t)TT * sizeof(struct rknpu_task), RKNPU_MEM_SYNC_TO_DEVICE);
 
-	for (int s = 0; s < T; s += per_submit) {
-		int cnt = T - s < per_submit ? T - s : per_submit;
-		if (submit(ctx, s, cnt, (cores == 3 && cnt >= 3) ? 3 : 1) < 0) return -1;
+	npu_lock(ctx);
+	for (int s = 0; s < TT; s += per_submit) {
+		int cnt = TT - s < per_submit ? TT - s : per_submit;
+		if (submit(ctx, s, cnt, (cores == 3 && cnt >= 3) ? 3 : 1) < 0) { npu_unlock(ctx); return -1; }
 	}
+	npu_unlock(ctx);
 
 	buf_sync(ctx, &ctx->c, c_bytes, RKNPU_MEM_SYNC_FROM_DEVICE);
 	if (J->C) {
 		t0 = now_us();
-		parallel_for(ctx, M, 64, unpack_range, J);
+		pfor_batched(ctx, J, M, 64, unpack_range);
 		ctx->stats.unpack_us += now_us() - t0;
 	}
 	return 0;
@@ -949,11 +1051,15 @@ static float *scratch(rk_ctx *ctx, int which, size_t n) {
 	return ctx->scr[which];
 }
 
+/* per-row (or per-column) max-abs for every batch element into amax_part[batch][rows] */
 static float amax_all(rk_ctx *ctx, job_t *J, int rows, range_fn fn) {
-	J->amax_part = scratch(ctx, 0, (size_t)rows);
-	parallel_for(ctx, ceil_div(rows, 64), 1, fn, J);
+	int nb = J->batch > 1 ? J->batch : 1;
+	J->amax_part = scratch(ctx, 0, (size_t)rows * nb);
+	J->part_stride = rows;
+	/* items are 64-row blocks; the scan functions index amax_part by row */
+	pfor_batched(ctx, J, ceil_div(rows, 64), 1, fn);
 	float mx = 0.f;
-	for (int i = 0; i < rows; i++) if (J->amax_part[i] > mx) mx = J->amax_part[i];
+	for (size_t i = 0; i < (size_t)rows * nb; i++) if (J->amax_part[i] > mx) mx = J->amax_part[i];
 	return mx;
 }
 
@@ -983,17 +1089,15 @@ static void split_b_range(void *v, int b, int e) {
 	}
 }
 
-int rk_gemm_ex(rk_ctx *ctx, int prec, int M, int N, int K,
-               const float *A, int64_t sa_m, int64_t sa_k,
-               const float *B, int64_t sb_k, int64_t sb_n,
-               float *C, int64_t ldc, int accumulate) {
-	double t_start = now_us();
-	memset(&ctx->stats, 0, sizeof(ctx->stats));
-	if (M <= 0 || N <= 0 || K <= 0) { set_err(ctx, "bad shape"); return -1; }
+static int gemm_front(rk_ctx *ctx, int prec, int batch, int M, int N, int K,
+                      const float *A, int64_t sa_b, int64_t sa_m, int64_t sa_k,
+                      const float *B, int64_t sb_b, int64_t sb_k, int64_t sb_n,
+                      float *C, int64_t sc_b, int64_t ldc, int accumulate) {
 	job_t J = {
 		.A = A, .B = B, .sa_m = sa_m, .sa_k = sa_k, .sb_k = sb_k, .sb_n = sb_n,
 		.M = M, .N = N, .K = K, .C = C, .ldc = ldc, .accumulate = accumulate,
 		.a_scale = 1.f, .b_scale = 1.f, .out_mul = 1.f,
+		.batch = batch, .sa_b = sa_b, .sb_b = sb_b, .sc_b = sc_b,
 	};
 	int r = -1;
 	double t0;
@@ -1009,6 +1113,7 @@ int rk_gemm_ex(rk_ctx *ctx, int prec, int M, int N, int K,
 			J.a_scale = pow2_scale(amax_all(ctx, &J, M, amax_a_rows));
 			J.b_scale = pow2_scale(amax_all(ctx, &J, N, amax_b_cols));
 			J.out_mul = 1.f / (J.a_scale * J.b_scale);
+			J.amax_part = NULL;
 			ctx->stats.pack_us += now_us() - t0;
 		}
 		r = gemm_engine(ctx, &J);
@@ -1018,22 +1123,33 @@ int rk_gemm_ex(rk_ctx *ctx, int prec, int M, int N, int K,
 		J.dt = &DT_I8_I32;
 		J.cv = CV_I8;
 		t0 = now_us();
-		float *ra = scratch(ctx, 1, (size_t)M), *cb = scratch(ctx, 2, (size_t)2 * N);
+		size_t RA = (size_t)M * batch, CB = (size_t)N * batch;
+		float *ra = scratch(ctx, 1, RA), *cb = scratch(ctx, 2, 2 * CB);
+		if (!ra || !cb) { set_err(ctx, "out of memory"); return -1; }
 		amax_all(ctx, &J, M, amax_a_rows);
-		for (int m = 0; m < M; m++) ra[m] = J.amax_part[m] > 0.f ? 127.f / J.amax_part[m] : 1.f;
+		for (size_t m = 0; m < RA; m++) ra[m] = J.amax_part[m] > 0.f ? 127.f / J.amax_part[m] : 1.f;
 		amax_all(ctx, &J, N, amax_b_cols);
-		for (int n = 0; n < N; n++) {
+		for (size_t n = 0; n < CB; n++) {
 			cb[n] = J.amax_part[n] > 0.f ? 127.f / J.amax_part[n] : 1.f;
-			cb[N + n] = 1.f / cb[n];
+			cb[CB + n] = 1.f / cb[n];
 		}
 		J.a_row = ra;
 		J.b_col = cb;
-		J.b_inv = cb + N;
+		J.b_inv = cb + CB;
+		J.amax_part = NULL;
 		ctx->stats.pack_us += now_us() - t0;
 		r = gemm_engine(ctx, &J);
 		break;
 	}
 	case RK_PREC_FP16X3: {
+		if (batch > 1) {   /* one batch element at a time */
+			r = 0;
+			for (int bb = 0; bb < batch && !r; bb++)
+				r = gemm_front(ctx, prec, 1, M, N, K, A + bb * sa_b, 0, sa_m, sa_k, B + bb * sb_b, 0, sb_k, sb_n,
+				               C + bb * sc_b, 0, ldc, accumulate);
+			break;
+		}
+		J.batch = 1;
 		/* C = Ah*Bh + 2^-11 * (Ah*Bl' + Al'*Bh): two NPU GEMMs, ~fp32 accuracy */
 		t0 = now_us();
 		float sa = pow2_scale(amax_all(ctx, &J, M, amax_a_rows));
@@ -1045,6 +1161,7 @@ int rk_gemm_ex(rk_ctx *ctx, int prec, int M, int N, int K,
 		S.C = A2; parallel_for(ctx, M, 8, split_a_range, &S);
 		S.C = B2; parallel_for(ctx, K, 8, split_b_range, &S);
 		ctx->stats.pack_us += now_us() - t0;
+		J.amax_part = NULL;
 		/* pass 1: Ah (first K columns of A2) x Bh (rows K..2K-1 of B2) */
 		job_t P = J;
 		P.dt = &DT_F16_F32; P.cv = CV_F16;
@@ -1067,9 +1184,53 @@ int rk_gemm_ex(rk_ctx *ctx, int prec, int M, int N, int K,
 		set_err(ctx, "unknown precision %d", prec);
 		return -1;
 	}
+	return r;
+}
+
+/* Split calls whose NPU buffers would exceed max_buf: batch halves first, then row bands. */
+static int gemm_split(rk_ctx *ctx, int prec, int batch, int M, int N, int K,
+                      const float *A, int64_t sa_b, int64_t sa_m, int64_t sa_k,
+                      const float *B, int64_t sb_b, int64_t sb_k, int64_t sb_n,
+                      float *C, int64_t sc_b, int64_t ldc, int accumulate) {
+	size_t Kp = (size_t)round_up(K, 32), Np = (size_t)round_up(N, 32), Mp = (size_t)round_up(M, 4);
+	size_t need = (size_t)batch * (Mp * Kp * 2 + Np * Kp * 2 + Mp * Np * 4);
+	if (prec == RK_PREC_FP16X3) need *= 2;
+	if (need > ctx->max_buf && batch > 1) {
+		int b1 = batch / 2;
+		int r = gemm_split(ctx, prec, b1, M, N, K, A, sa_b, sa_m, sa_k, B, sb_b, sb_k, sb_n, C, sc_b, ldc, accumulate);
+		if (r) return r;
+		return gemm_split(ctx, prec, batch - b1, M, N, K, A + b1 * sa_b, sa_b, sa_m, sa_k, B + b1 * sb_b, sb_b,
+		                  sb_k, sb_n, C + b1 * sc_b, sc_b, ldc, accumulate);
+	}
+	if (need > ctx->max_buf && M > 64) {
+		int m1 = (M / 2 + 3) & ~3;
+		int r = gemm_split(ctx, prec, batch, m1, N, K, A, sa_b, sa_m, sa_k, B, sb_b, sb_k, sb_n, C, sc_b, ldc, accumulate);
+		if (r) return r;
+		return gemm_split(ctx, prec, batch, M - m1, N, K, A + (int64_t)m1 * sa_m, sa_b, sa_m, sa_k, B, sb_b, sb_k, sb_n,
+		                  C + (int64_t)m1 * ldc, sc_b, ldc, accumulate);
+	}
+	return gemm_front(ctx, prec, batch, M, N, K, A, sa_b, sa_m, sa_k, B, sb_b, sb_k, sb_n, C, sc_b, ldc, accumulate);
+}
+
+int rk_gemm_batched(rk_ctx *ctx, int prec, int batch, int M, int N, int K,
+                    const float *A, int64_t sa_b, int64_t sa_m, int64_t sa_k,
+                    const float *B, int64_t sb_b, int64_t sb_k, int64_t sb_n,
+                    float *C, int64_t sc_b, int64_t ldc, int accumulate) {
+	double t_start = now_us();
+	memset(&ctx->stats, 0, sizeof(ctx->stats));
+	if (M <= 0 || N <= 0 || K <= 0 || batch <= 0) { set_err(ctx, "bad shape"); return -1; }
+	int r = gemm_split(ctx, prec, batch, M, N, K, A, sa_b, sa_m, sa_k, B, sb_b, sb_k, sb_n, C, sc_b, ldc, accumulate);
 	ctx->stats.total_us = now_us() - t_start;
 	return r;
 }
+
+int rk_gemm_ex(rk_ctx *ctx, int prec, int M, int N, int K,
+               const float *A, int64_t sa_m, int64_t sa_k,
+               const float *B, int64_t sb_k, int64_t sb_n,
+               float *C, int64_t ldc, int accumulate) {
+	return rk_gemm_batched(ctx, prec, 1, M, N, K, A, 0, sa_m, sa_k, B, 0, sb_k, sb_n, C, 0, ldc, accumulate);
+}
+
 
 int rk_gemm_f32(rk_ctx *ctx, int M, int N, int K,
                 const float *A, int64_t sa_m, int64_t sa_k,
@@ -1111,5 +1272,46 @@ int rk_probe_raw(rk_ctx *ctx, const rk_probe_cfg *cfg, int M, int N, int K,
 	if (submit(ctx, 0, 1, 1) < 0) return -1;
 	buf_sync(ctx, &ctx->c, c_bytes, RKNPU_MEM_SYNC_FROM_DEVICE);
 	memcpy(c_rows, ctx->c.ptr, c_bytes);
+	return 0;
+}
+
+/* ------------------------------------------------------------------------------------
+ * Raw convolution probe: one task, NHWC fp16 input (whole image), caller-laid-out
+ * weights, NHWC fp32 output. Used to work out the convolution register programming.
+ * ---------------------------------------------------------------------------------- */
+int rk_conv_raw(rk_ctx *ctx, const rk_conv_cfg *c, const void *in_nhwc, const void *w_bytes, void *out_nhwc) {
+	const dtype_t *dt = &DT_F16_F32;
+	size_t in_b = (size_t)c->h * c->w * c->c * 2, w_b = (size_t)c->n * c->kh * c->kw * c->c * 2;
+	size_t out_b = (size_t)c->oh * c->ow * c->n * 4;
+	uint32_t dflags = MEM_FLAG_400 | RKNPU_MEM_CACHEABLE | RKNPU_MEM_NON_CONTIGUOUS;
+	if (buf_ensure(ctx, &ctx->a, in_b, dflags) || buf_ensure(ctx, &ctx->b, w_b, dflags) ||
+	    buf_ensure(ctx, &ctx->c, out_b, dflags) || buf_ensure(ctx, &ctx->regcmd, REGCMD_SLOTS * 8, dflags) ||
+	    buf_ensure(ctx, &ctx->tasks, sizeof(struct rknpu_task), dflags | RKNPU_MEM_KERNEL_MAPPING))
+		return -1;
+	memcpy(ctx->a.ptr, in_nhwc, in_b);
+	memcpy(ctx->b.ptr, w_bytes, w_b);
+	memset(ctx->c.ptr, 0x7f, out_b);
+	buf_sync(ctx, &ctx->a, in_b, RKNPU_MEM_SYNC_TO_DEVICE);
+	buf_sync(ctx, &ctx->b, w_b, RKNPU_MEM_SYNC_TO_DEVICE);
+	buf_sync(ctx, &ctx->c, out_b, RKNPU_MEM_SYNC_TO_DEVICE);
+	int dbanks = c->dbanks > 0 ? c->dbanks : ceil_div((int)in_b + c->w * c->c * 2, CBUF_BANK_SIZE);
+	int wbanks = CBUF_BANKS - dbanks;
+	task_desc d = { .dt = dt, .m = c->h, .k = c->c, .n = c->n, .grains = c->grains > 0 ? c->grains : c->h + 1,
+	                .dbanks = dbanks, .wbanks = wbanks, .reuse = 0, .in_dma = (uint32_t)ctx->a.dma,
+	                .w_dma = (uint32_t)ctx->b.dma, .out_dma = (uint32_t)ctx->c.dma, .next_dma = 0,
+	                .in_w = c->w, .in_h = c->h, .out_w = c->ow, .out_h = c->oh, .kw = c->kw, .kh = c->kh,
+	                .sx = c->sx, .sy = c->sy, .pl = c->pl, .pt = c->pt };
+	emit_task(ctx->regcmd.ptr, &d);
+	struct rknpu_task td = { .enable_mask = 0xd, .int_mask = 0x300, .int_clear = 0x1ffff,
+	                         .regcfg_amount = REGCFG_AMOUNT, .regcmd_addr = ctx->regcmd.dma };
+	*(struct rknpu_task *)ctx->tasks.ptr = td;
+	buf_sync(ctx, &ctx->regcmd, REGCMD_SLOTS * 8, RKNPU_MEM_SYNC_TO_DEVICE);
+	buf_sync(ctx, &ctx->tasks, sizeof(td), RKNPU_MEM_SYNC_TO_DEVICE);
+	npu_lock(ctx);
+	int r = submit(ctx, 0, 1, 1);
+	npu_unlock(ctx);
+	if (r < 0) return -1;
+	buf_sync(ctx, &ctx->c, out_b, RKNPU_MEM_SYNC_FROM_DEVICE);
+	memcpy(out_nhwc, ctx->c.ptr, out_b);
 	return 0;
 }
