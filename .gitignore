@@ -1,0 +1,12 @@
+*.o
+*.so
+__pycache__/
+*.pyc
+csrc/gemm_test
+venv/
+.claude/
+CLAUDE.md
+*.md
+!README.md
+jobs/
+logs/
