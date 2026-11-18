@@ -23,6 +23,7 @@ class RkStats(ctypes.Structure):
         ("m_tile", ctypes.c_int),
         ("k_tile", ctypes.c_int),
         ("n_tile", ctypes.c_int),
+        ("sync_us", ctypes.c_double),
     ]
 
     def as_dict(self):

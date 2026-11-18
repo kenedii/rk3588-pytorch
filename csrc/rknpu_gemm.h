@@ -25,6 +25,7 @@ typedef struct {
 	int    tasks;       /* NPU tasks in the last call */
 	int    submits;     /* submit ioctls in the last call */
 	int    m_tile, k_tile, n_tile;
+	double sync_us;     /* CPU cache maintenance (MEM_SYNC ioctls) */
 } rk_stats;
 
 /* Opens the NPU DRM node (NULL = auto-detect the "rknpu" card). Returns NULL on failure. */
@@ -32,7 +33,7 @@ rk_ctx *rk_open(const char *dev);
 void    rk_close(rk_ctx *ctx);
 const char *rk_last_error(rk_ctx *ctx);
 
-/* Execution mode: 0 = one submit per task (single core),
+/* Execution mode (default 2): 0 = one submit per task (single core),
  *                 1 = all tasks chained in one submit (single core),
  *                 2 = chained, split across the three NPU cores. */
 void rk_set_mode(rk_ctx *ctx, int mode);

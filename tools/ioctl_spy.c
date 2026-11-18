@@ -76,6 +76,22 @@ int ioctl(int fd, unsigned long req, ...) {
 					for (uint32_t k = 0; k < tk[i].regcfg_amount + 4 && k < 512; k++)
 						fprintf(out, "  %3u op=%04x reg=%04x val=%08x\n", k, (unsigned)(ops[k] >> 48),
 							(unsigned)(ops[k] & 0xffff), (unsigned)((ops[k] >> 16) & 0xffffffff));
+					if (getenv("SPY_DUMP_W") && i == s->task_start) {
+						/* dump the first fp16 values of the weight buffer (reg 0x1110) */
+						for (uint32_t k = 0; k < tk[i].regcfg_amount; k++) {
+							if ((ops[k] & 0xffff) != 0x1110) continue;
+							uint32_t wd = (uint32_t)((ops[k] >> 16) & 0xffffffff);
+							ent *w = by_dma(wd);
+							if (w && w->ptr) {
+								_Float16 *h = (_Float16 *)((char *)w->ptr + (wd - w->dma));
+								int nd = atoi(getenv("SPY_DUMP_W"));
+								fprintf(out, "  WEIGHTS@%#x:", wd);
+								for (int q = 0; q < nd; q++) fprintf(out, "%s%d", q % 32 ? " " : "\n   ", (int)h[q]);
+								fprintf(out, "\n");
+							}
+							break;
+						}
+					}
 				} else fprintf(out, "  (regcmd buffer not mapped by this process)\n");
 			}
 		} else fprintf(out, " (task buffer not mapped)\n");

@@ -47,8 +47,8 @@ int main(int argc, char **argv) {
 		if (st.total_us < best) best = st.total_us;
 	}
 	double gflop = 2.0 * M * N * K / 1e9;
-	printf("M=%d N=%d K=%d tA=%d tB=%d | tiles m%d k%d n%d tasks %d submits %d | pack %.0fus submit %.0fus hw %.0fus unpack %.0fus total %.0fus | %.1f GFLOPS (best %.1f)\n",
-	       M, N, K, ta, tb, st.m_tile, st.k_tile, st.n_tile, st.tasks, st.submits, st.pack_us, st.submit_us, st.hw_us,
+	printf("M=%d N=%d K=%d tA=%d tB=%d | tiles m%d k%d n%d tasks %d submits %d | pack %.0fus sync %.0fus submit %.0fus hw %.0fus unpack %.0fus total %.0fus | %.1f GFLOPS (best %.1f)\n",
+	       M, N, K, ta, tb, st.m_tile, st.k_tile, st.n_tile, st.tasks, st.submits, st.pack_us, st.sync_us, st.submit_us, st.hw_us,
 	       st.unpack_us, st.total_us, gflop / (st.total_us / 1e6), gflop / (best / 1e6));
 	if (check) {
 		/* reference uses fp16-rounded inputs so the residual is accumulation/output error only */

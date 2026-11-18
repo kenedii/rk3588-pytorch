@@ -27,6 +27,7 @@ int main(int argc, char **argv) {
 	srand(1);
 	for (int i = 0; i < M * K; i++) pa[i] = (_Float16)((rand() % 200 - 100) / 50.0f);
 	for (int i = 0; i < K * N; i++) pb[i] = (_Float16)((rand() % 200 - 100) / 50.0f);
+	if (getenv("B_INDEX")) for (int k = 0; k < K; k++) for (int n = 0; n < N; n++) pb[k * N + n] = (_Float16)(k + K * n);
 	rknn_matmul_set_io_mem(ctx, a, &io.A); rknn_matmul_set_io_mem(ctx, b, &io.B); rknn_matmul_set_io_mem(ctx, c, &io.C);
 	double best = 1e30;
 	for (int i = 0; i < reps; i++) {
