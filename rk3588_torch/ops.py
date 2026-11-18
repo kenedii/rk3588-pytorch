@@ -705,41 +705,42 @@ def conv1d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, act=
 
 
 def conv_transpose2d(x, weight, bias=None, stride=1, padding=0, output_padding=0, groups=1, dilation=1):
-    """F.conv_transpose2d on the NPU. kernel == stride with no padding (the usual 2x upsampling
-    layer) is a single GEMM; other cases become a convolution of the zero-dilated input with
-    the flipped kernel. Returns None if unsupported (output padding >= stride, padding > k-1,
-    dilation)."""
+    """F.conv_transpose2d on the NPU, as one GEMM per group producing every kernel tap's
+    contribution (N*H*W x C) @ (C x O*kh*kw), then a CPU scatter-add of the taps into the
+    output (F.fold, i.e. col2im). Unlike convolving the zero-dilated input, this does no
+    wasted multiply-adds. kernel == stride without padding needs no scatter at all (a pixel
+    shuffle). Returns None if unsupported (dilation, or too small for the NPU)."""
     st, pd, op, dl = _pair(stride), _pair(padding), _pair(output_padding), _pair(dilation)
     if x.dim() != 4 or weight.dim() != 4 or dl != (1, 1) or isinstance(padding, str):
         return None
     N, C, H, W = x.shape
     Cin, Og, kh, kw = weight.shape
-    if Cin != C or C % groups:
+    if Cin != C or C % groups or op[0] >= max(st[0], 1) or op[1] >= max(st[1], 1):
         return None
-    O = Og * groups
-    if (kh, kw) == st and pd == (0, 0) and op == (0, 0) and groups == 1:
-        # y[n, o, i*s+a, j*s+b] = sum_c x[n, c, i, j] w[c, o, a, b]: one (N*H*W, C) @ (C, O*kh*kw) GEMM
-        xm = x.permute(0, 2, 3, 1).reshape(N * H * W, C)
-        if xm.shape[0] * C * O * kh * kw < threshold():
-            return None
-        ym = torch.ops.rknpu.mm(xm, weight.reshape(C, O * kh * kw), _precision, "convT.w")
-        y = ym.reshape(N, H, W, O, kh, kw).permute(0, 3, 1, 4, 2, 5).reshape(N, O, H * kh, W * kw)
-        y = y.to(_out_dtype(x, weight))
-        if bias is not None:
-            y = y + bias.view(1, -1, 1, 1)
-        return y
-    if pd[0] > kh - 1 or pd[1] > kw - 1 or op[0] >= max(st[0], 1) or op[1] >= max(st[1], 1):
+    G, Cg = groups, C // groups
+    O = Og * G
+    if N * H * W * C * Og * kh * kw < threshold():
         return None
-    # zero-dilate the input, extra zero rows/columns at the bottom/right for output_padding
-    Hd, Wd = (H - 1) * st[0] + 1 + op[0], (W - 1) * st[1] + 1 + op[1]
-    if st != (1, 1) or op != (0, 0):
-        xd = x.new_zeros((N, C, Hd, Wd))
-        xd[:, :, :(H - 1) * st[0] + 1:st[0], :(W - 1) * st[1] + 1:st[1]] = x
+    xm = x.permute(0, 2, 3, 1).reshape(N * H * W, C)
+    if G == 1:
+        cols = torch.ops.rknpu.mm(xm, weight.reshape(C, O * kh * kw), _precision, "convT.w")   # NHW, O*kh*kw
     else:
-        xd = x
-    # weight (C, O/G, kh, kw) -> (O, C/G, kh, kw) per group, rotated 180 degrees
-    wc = weight.reshape(groups, C // groups, Og, kh, kw).transpose(1, 2).reshape(O, C // groups, kh, kw).flip(2, 3)
-    return conv2d(xd, wc, bias, 1, (kh - 1 - pd[0], kw - 1 - pd[1]), 1, groups)
+        xg = xm.reshape(N * H * W, G, Cg).transpose(0, 1)                                     # G, NHW, Cg
+        cols = torch.ops.rknpu.mm(xg, weight.reshape(G, Cg, Og * kh * kw), _precision)        # G, NHW, Og*kh*kw
+        cols = cols.transpose(0, 1).reshape(N * H * W, O * kh * kw)
+    Ho = (H - 1) * st[0] - 2 * pd[0] + kh + op[0]
+    Wo = (W - 1) * st[1] - 2 * pd[1] + kw + op[1]
+    if (kh, kw) == st and pd == (0, 0):
+        y = cols.reshape(N, H, W, O, kh, kw).permute(0, 3, 1, 4, 2, 5).reshape(N, O, H * kh, W * kw)
+        if op != (0, 0):
+            y = torch.nn.functional.pad(y, (0, op[1], 0, op[0]))
+    else:
+        cols = cols.reshape(N, H * W, O * kh * kw).transpose(1, 2)                           # N, O*kh*kw, HW
+        y = torch.nn.functional.fold(cols, (Ho, Wo), (kh, kw), padding=pd, stride=st)
+    y = y.to(_out_dtype(x, weight))
+    if bias is not None:
+        y = y + bias.view(1, -1, 1, 1)
+    return y
 
 
 def release():
