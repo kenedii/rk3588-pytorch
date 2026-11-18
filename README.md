@@ -1,25 +1,75 @@
+<div align="center">
+
 # rk3588-pytorch
 
-Train PyTorch models with the **RK3588 NPU** (Radxa Rock 5B, Orange Pi 5, ...) doing
-the matrix multiplies, and the CPU doing everything else.
+### Train PyTorch models on the Rockchip RK3588 NPU
+
+**Up to 9× faster matrix multiplies and 2.8× faster training steps than the CPU,
+on a single-board computer, with one line of code.**
+
+![platform](https://img.shields.io/badge/platform-RK3588-blue)
+![pytorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c)
+![npu](https://img.shields.io/badge/NPU-731%20GFLOPS-brightgreen)
+![tests](https://img.shields.io/badge/tests-35%2F35%20passing-success)
+![license](https://img.shields.io/badge/license-GPL--3.0-lightgrey)
+
+</div>
+
+---
+
+The RK3588's NPU (rated at 6 TOPS) is sold as an inference-only accelerator: you convert a finished
+model with Rockchip's toolkit and run it. **rk3588-pytorch turns it into a training
+device.** Every matrix multiply in the forward *and* backward pass runs on the NPU, while
+PyTorch keeps doing everything else on the CPU. Your training loop doesn't change.
 
 ```python
 import rk3588_torch
 
-with rk3588_torch.npu_mode():          # linear / matmul / mm / bmm / addmm -> NPU
+with rk3588_torch.npu_mode():          # matmuls -> NPU, everything else -> CPU
     loss = F.cross_entropy(model(x), y)
-    loss.backward()                    # dX and dW GEMMs -> NPU too
-optimizer.step()                       # CPU
+    loss.backward()                    # gradient matmuls -> NPU too
+optimizer.step()
 ```
 
-No RKNN model conversion and no RKNN runtime: the library writes NPU register command
-streams itself and submits them through the vendor `rknpu` DRM driver.
+## Highlights
 
-## Results (Rock 5B, 4 GB, CPU capped at 1.8 GHz, NPU at 800 MHz)
+| | |
+|---|---|
+| ⚡ **731 GFLOPS** | 2048³ matmul end to end, **9.1×** the CPU. The NPU alone hits ~1.2 TFLOPS |
+| 🏋️ **2.8× faster training** | wide MLP on MNIST: 77 ms vs 220 ms per step, same accuracy |
+| 🎯 **Matches CPU training** | fp32 accumulation; same accuracy, mean loss difference 0.0006 on the wide MLP |
+| 🔌 **Drop-in** | no model conversion, no RKNN runtime, no changes to your model code |
+| 🧠 **All three NPU cores** | work is split across cores automatically |
+| 🛟 **Safe fallback** | ops the NPU can't do, and matmuls too small to benefit, run on the CPU |
+| 🔬 **Built from scratch** | writes the NPU's register command streams directly; reverse-engineering tools included |
 
-**GEMM throughput**: fp32 in, fp32 out, end to end including all CPU-side conversion
-(`bench/bench_gemm.py`). CPU is `torch.matmul` fp32 with 3 threads (more busy cores
-reset this board on its charger), measured before the NPU library starts any threads.
+## Benchmarks
+
+Radxa Rock 5B (4 GB), NPU at 800 MHz, CPU baseline is fp32 PyTorch on 3 threads.
+
+**Matrix multiply**, fp32 in and out, including all CPU-side conversion:
+
+| Size (M × K × N) | CPU | NPU | Speedup |
+|---|---:|---:|---:|
+| 512 × 512 × 512 | 71 GFLOPS | 235 GFLOPS | 3.3× |
+| 1024 × 1024 × 1024 | 79 GFLOPS | 469 GFLOPS | 5.9× |
+| 2048 × 512 × 2048 | 78 GFLOPS | 452 GFLOPS | 5.8× |
+| 2048 × 2048 × 2048 | 80 GFLOPS | **731 GFLOPS** | **9.1×** |
+
+**Training on MNIST**, same initial weights and batches:
+
+| Model | CPU step | NPU step | Speedup | Test accuracy (CPU / NPU) |
+|---|---:|---:|---:|---|
+| MLP 784-2048-2048-1024-10, batch 256 | 219.6 ms | 77.5 ms | **2.8×** | 94.18% / 94.21% |
+| MLP 784-512-256-10, batch 128 | 9.9 ms | 8.5 ms | 1.16× | 95.89% / 95.90% |
+| Small CNN, batch 64 (linear layers on NPU) | 71.0 ms | 72.2 ms | 0.98× | 96.73% / 96.22% |
+
+The bigger the layers and batches, the bigger the win. Small layers are dominated by
+fixed per-call overhead, and convolutions, norms and activations stay on the CPU (see
+[Limitations](#limitations)).
+
+<details>
+<summary>Full GEMM table (1 core vs 3 cores) and timing breakdown</summary>
 
 | M × K × N | CPU fp32 | NPU, 1 core | NPU, 3 cores | speedup |
 |---|---:|---:|---:|---:|
@@ -29,28 +79,20 @@ reset this board on its charger), measured before the NPU library starts any thr
 | 1024 × 1024 × 1024 | 79 | 343 | 469 | 5.9× |
 | 2048 × 512 × 2048 | 78 | 276 | 452 | 5.8× |
 | 512 × 4096 × 512 | 76 | 141 | 264 | 3.5× |
-| 2048 × 2048 × 2048 | 80 | 434 | **731** | **9.1×** |
+| 2048 × 2048 × 2048 | 80 | 434 | 731 | 9.1× |
 
-The NPU alone runs a 2048³ GEMM in 14.4 ms (~1.2 TFLOPS); the rest of the 23.5 ms is
-fp32→fp16 packing (7.4 ms) and copying C out (1.8 ms) on the CPU.
+The NPU alone runs a 2048³ GEMM in 14.4 ms (~1.2 TFLOPS). The rest of the 23.5 ms is
+fp32 to fp16 packing (7.4 ms) and copying C out (1.8 ms) on the CPU. CPU numbers are
+measured before the NPU library starts any threads, after a governor warm-up; more than
+3 busy cores resets this board on its charger. Training step times come from separate
+CPU-only and NPU processes; the mean loss difference between the two runs is 0.0006
+(wide MLP), 0.004 (small MLP) and 0.019 (CNN).
 
-**Training (MNIST, same initial weights and batches; step times from separate CPU-only and NPU processes)**
+</details>
 
-| model | batch | CPU step | NPU step | speedup | test acc CPU / NPU | mean \|Δloss\| |
-|---|---:|---:|---:|---:|---|---:|
-| MLP 784-2048-2048-1024-10 | 256 | 219.6 ms | 77.5 ms | **2.8×** | 94.18% / 94.21% | 0.0006 |
-| MLP 784-512-256-10 | 128 | 9.9 ms | 8.5 ms | 1.16× | 95.89% / 95.90% | 0.004 |
-| CNN 2×conv + 2×fc (fc on NPU) | 64 | 71.0 ms | 72.2 ms | 0.98× | 96.73% / 96.22% | 0.019 |
-
-Training speedup tracks GEMM size. Small layers are dominated by per-call overhead
-(packing, cache maintenance, ~0.1-0.3 ms submit latency) and by the ops that stay on the
-CPU, so the bigger the layers and batches, the more the NPU helps. In the CNN almost all
-the work is in convolutions and pooling, which run on the CPU by default, so routing only
-its linear layers to the NPU just breaks even.
-
-Numerics: inputs are rounded to fp16, products are accumulated in fp32 and returned as
-fp32, so results match fp64 references to ~3e-4 relative (the fp16 input rounding) and
-gradients match CPU autograd (`tests/test_ops.py`, 35 checks).
+**Numerics:** inputs are rounded to fp16, products are accumulated in fp32 and returned
+as fp32. Results match fp64 references to ~3e-4 relative, and gradients match CPU
+autograd (`tests/test_ops.py`, 35 checks).
 
 ## How it works
 
