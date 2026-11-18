@@ -525,10 +525,8 @@ static inline uint16_t f32_to_bf16(float x) {
 }
 
 static inline int8_t f32_to_i8(float x) {
-	float r = __builtin_roundf(x);
-	if (r > 127.f) r = 127.f;
-	if (r < -127.f) r = -127.f;
-	return (int8_t)r;
+	x = x > 127.f ? 127.f : (x < -127.f ? -127.f : x);
+	return (int8_t)(int)(x + __builtin_copysignf(0.5f, x));   /* truncation after +-0.5 = round */
 }
 
 typedef struct {
@@ -541,6 +539,7 @@ typedef struct {
 	size_t a_chunk, b_tile, c_tile;       /* elements */
 	float a_scale, b_scale;               /* uniform input scales (fp16/bf16) */
 	const float *a_row, *b_col;           /* per-row / per-column scales (int8) */
+	const float *b_inv;                   /* 1 / b_col */
 	float *C;
 	int64_t ldc;
 	int accumulate;
@@ -629,50 +628,76 @@ static void pack_b_range(void *v, int b, int e) {
 	}
 }
 
-/* fast path for the common fp16 case with B read along k (sb_k == 1, i.e. Linear weights) */
-static void pack_b_f16_range(void *v, int b, int e) {
-	job_t *J = v;
-	const int Kc = J->Kc, Nc = J->Nc, K = J->K, N = J->N;
-	const float sc = J->b_scale;
-	for (int it = b; it < e; it++) {
-		int jc = it / (Nc / 16), ng = it % (Nc / 16);
-		int j = jc / J->nn, c = jc % J->nn;
-		f16 *dst = (f16 *)J->bp + (size_t)jc * J->b_tile + (size_t)ng * 16 * Kc;
-		if (J->sb_n == 1 && J->sb_k != 1) {
-			for (int cb = 0; cb < Kc / 32; cb++)
-				for (int kr = 0; kr < 32; kr++) {
-					int gk = j * Kc + cb * 32 + kr;
-					const float *s = J->B + (int64_t)gk * J->sb_k + (int64_t)(c * Nc + ng * 16);
-					for (int nr = 0; nr < 16; nr++) {
-						int gn = c * Nc + ng * 16 + nr;
-						dst[cb * 512 + nr * 32 + kr] = (gk < K && gn < N) ? (f16)(s[nr] * sc) : (f16)0;
-					}
-				}
-		} else {
-			for (int cb = 0; cb < Kc / 32; cb++)
-				for (int nr = 0; nr < 16; nr++) {
-					int gn = c * Nc + ng * 16 + nr;
-					f16 *d = dst + cb * 512 + nr * 32;
-					int k0 = j * Kc + cb * 32;
-					if (gn < N && k0 + 32 <= K) {
-						const float *s = J->B + (int64_t)k0 * J->sb_k + (int64_t)gn * J->sb_n;
-						if (J->sb_k == 1) { for (int t = 0; t < 32; t++) d[t] = (f16)(s[t] * sc); }
-						else { for (int t = 0; t < 32; t++) d[t] = (f16)(s[(int64_t)t * J->sb_k] * sc); }
-					} else {
-						for (int t = 0; t < 32; t++) {
-							int gk = k0 + t;
-							d[t] = (gn < N && gk < K) ? (f16)(J->B[(int64_t)gk * J->sb_k + (int64_t)gn * J->sb_n] * sc) : (f16)0;
-						}
-					}
-				}
-		}
-	}
+/* Typed fast B packers: layout [Nc/G][Kc/32][G][32]; both source orders handled with
+ * contiguous reads (row-major B: 32 k-rows x G consecutive n; column-major: 32 consecutive k). */
+#define DEFINE_PACK_B(NAME, T, G, CONV)                                                          \
+static void NAME(void *v, int b, int e) {                                                        \
+	job_t *J = v;                                                                                \
+	const int Kc = J->Kc, Nc = J->Nc, K = J->K, N = J->N;                                        \
+	for (int it = b; it < e; it++) {                                                             \
+		int jc = it / (Nc / G), ng = it % (Nc / G);                                              \
+		int j = jc / J->nn, c = jc % J->nn;                                                      \
+		T *dst = (T *)J->bp + (size_t)jc * J->b_tile + (size_t)ng * G * Kc;                      \
+		int nb = c * Nc + ng * G;                                                                \
+		if (J->sb_n == 1 && J->sb_k != 1) {                                                      \
+			for (int cb = 0; cb < Kc / 32; cb++)                                                 \
+				for (int kr = 0; kr < 32; kr++) {                                                \
+					int gk = j * Kc + cb * 32 + kr;                                              \
+					const float *s = J->B + (int64_t)gk * J->sb_k + nb;                          \
+					for (int nr = 0; nr < G; nr++) {                                             \
+						int gn = nb + nr;                                                        \
+						float x = (gk < K && gn < N) ? s[nr] : 0.f;                              \
+						dst[cb * 32 * G + nr * 32 + kr] = CONV(x, gn);                           \
+					}                                                                            \
+				}                                                                                \
+		} else {                                                                                 \
+			for (int nr = 0; nr < G; nr++) {                                                     \
+				int gn = nb + nr;                                                                \
+				const float *s = J->B + (int64_t)gn * J->sb_n;                                   \
+				for (int cb = 0; cb < Kc / 32; cb++) {                                           \
+					T *d = dst + cb * 32 * G + nr * 32;                                          \
+					int k0 = j * Kc + cb * 32;                                                   \
+					if (gn < N && k0 + 32 <= K) {                                                \
+						if (J->sb_k == 1) { for (int t = 0; t < 32; t++) d[t] = CONV(s[k0 + t], gn); } \
+						else { for (int t = 0; t < 32; t++) d[t] = CONV(s[(int64_t)(k0 + t) * J->sb_k], gn); } \
+					} else {                                                                     \
+						for (int t = 0; t < 32; t++) {                                           \
+							int gk = k0 + t;                                                     \
+							float x = (gn < N && gk < K) ? s[(int64_t)gk * J->sb_k] : 0.f;       \
+							d[t] = CONV(x, gn);                                                  \
+						}                                                                        \
+					}                                                                            \
+				}                                                                                \
+			}                                                                                    \
+		}                                                                                        \
+	}                                                                                            \
 }
+#define CONV_F16(x, n)  ((f16)((x) * J->b_scale))
+#define CONV_BF16(x, n) (f32_to_bf16((x) * J->b_scale))
+#define CONV_I8(x, n)   (f32_to_i8((x) * J->b_col[n]))
+DEFINE_PACK_B(pack_b_f16_range, f16, 16, CONV_F16)
+DEFINE_PACK_B(pack_b_bf16_range, uint16_t, 16, CONV_BF16)
+DEFINE_PACK_B(pack_b_i8_range, int8_t, 32, CONV_I8)
 
 /* C: row-major [Mp][Nc] tiles -> C, reducing K chunks and undoing input scales */
 static void unpack_range(void *v, int b, int e) {
 	job_t *J = v;
 	const int ob = J->dt->out_prec;
+	if (ob == PREC_INT32 && J->nk == 1) {
+		for (int m = b; m < e; m++) {
+			float *crow = J->C + (int64_t)m * J->ldc;
+			const float ra = J->out_mul / J->a_row[m];
+			for (int c = 0; c < J->nn; c++) {
+				int n0 = c * J->Nc;
+				int ncols = J->N - n0 < J->Nc ? J->N - n0 : J->Nc;
+				const int32_t *src = (const int32_t *)J->cp + (size_t)c * J->c_tile + (size_t)m * J->Nc;
+				const float *bi = J->b_inv + n0;
+				if (J->accumulate) { for (int n = 0; n < ncols; n++) crow[n0 + n] += (float)src[n] * ra * bi[n]; }
+				else { for (int n = 0; n < ncols; n++) crow[n0 + n] = (float)src[n] * ra * bi[n]; }
+			}
+		}
+		return;
+	}
 	if (ob == PREC_FP32 && J->nk == 1) {
 		/* fast path: one K chunk, fp32 tiles */
 		const float mul = J->out_mul;
@@ -717,27 +742,65 @@ static void unpack_range(void *v, int b, int e) {
 	}
 }
 
-/* max |A(m,:)| per row (int8) or global max |A| into amax_part[item] */
+/* max-abs scans on the IEEE bit patterns (sign cleared): integer max vectorizes cleanly
+ * and orders non-negative floats correctly (NaN sorts above inf, handled by pow2_scale). */
+static inline uint32_t absbits(float x) { uint32_t u; memcpy(&u, &x, 4); return u & 0x7fffffffu; }
+static inline float bitsf(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+
+/* max |A(m,:)| per row into amax_part[m]; items are 64-row blocks */
 static void amax_a_rows(void *v, int b, int e) {
 	job_t *J = v;
-	for (int m = b; m < e; m++) {
-		float mx = 0.f;
-		for (int k = 0; k < J->K; k++) {
-			float x = __builtin_fabsf(J->A[(int64_t)m * J->sa_m + (int64_t)k * J->sa_k]);
-			if (x > mx) mx = x;
+	uint32_t *mx = (uint32_t *)J->amax_part;
+	for (int it = b; it < e; it++) {
+		int m0 = it * 64, m1 = m0 + 64 < J->M ? m0 + 64 : J->M;
+		if (J->sa_k == 1) {
+			for (int m = m0; m < m1; m++) {
+				const uint32_t *s = (const uint32_t *)(J->A + (int64_t)m * J->sa_m);
+				uint32_t x = 0;
+				for (int k = 0; k < J->K; k++) { uint32_t a = s[k] & 0x7fffffffu; x = a > x ? a : x; }
+				mx[m] = x;
+			}
+		} else {
+			for (int m = m0; m < m1; m++) mx[m] = 0;
+			for (int k = 0; k < J->K; k++) {
+				const float *s = J->A + (int64_t)k * J->sa_k;
+				if (J->sa_m == 1) {
+					const uint32_t *su = (const uint32_t *)s;
+					for (int m = m0; m < m1; m++) { uint32_t a = su[m] & 0x7fffffffu; mx[m] = a > mx[m] ? a : mx[m]; }
+				} else {
+					for (int m = m0; m < m1; m++) { uint32_t a = absbits(s[(int64_t)m * J->sa_m]); mx[m] = a > mx[m] ? a : mx[m]; }
+				}
+			}
 		}
-		J->amax_part[m] = mx;
+		for (int m = m0; m < m1; m++) J->amax_part[m] = bitsf(mx[m]);
 	}
 }
+/* max |B(:,n)| per column into amax_part[n]; items are 64-column blocks */
 static void amax_b_cols(void *v, int b, int e) {
 	job_t *J = v;
-	for (int n = b; n < e; n++) {
-		float mx = 0.f;
-		for (int k = 0; k < J->K; k++) {
-			float x = __builtin_fabsf(J->B[(int64_t)k * J->sb_k + (int64_t)n * J->sb_n]);
-			if (x > mx) mx = x;
+	uint32_t *mx = (uint32_t *)J->amax_part;
+	for (int it = b; it < e; it++) {
+		int n0 = it * 64, n1 = n0 + 64 < J->N ? n0 + 64 : J->N;
+		if (J->sb_k == 1) {
+			for (int n = n0; n < n1; n++) {
+				const uint32_t *s = (const uint32_t *)(J->B + (int64_t)n * J->sb_n);
+				uint32_t x = 0;
+				for (int k = 0; k < J->K; k++) { uint32_t a = s[k] & 0x7fffffffu; x = a > x ? a : x; }
+				mx[n] = x;
+			}
+		} else {
+			for (int n = n0; n < n1; n++) mx[n] = 0;
+			for (int k = 0; k < J->K; k++) {
+				const float *s = J->B + (int64_t)k * J->sb_k;
+				if (J->sb_n == 1) {
+					const uint32_t *su = (const uint32_t *)s;
+					for (int n = n0; n < n1; n++) { uint32_t a = su[n] & 0x7fffffffu; mx[n] = a > mx[n] ? a : mx[n]; }
+				} else {
+					for (int n = n0; n < n1; n++) { uint32_t a = absbits(s[(int64_t)n * J->sb_n]); mx[n] = a > mx[n] ? a : mx[n]; }
+				}
+			}
 		}
-		J->amax_part[n] = mx;
+		for (int n = n0; n < n1; n++) J->amax_part[n] = bitsf(mx[n]);
 	}
 }
 
@@ -810,8 +873,11 @@ static int gemm_engine(rk_ctx *ctx, job_t *J) {
 	double t0 = now_us();
 	if (J->A) parallel_for(ctx, nk * J->nblk, 4, pack_a_range, J);
 	if (J->B) {
-		if (J->cv == CV_F16 && G == 16) parallel_for(ctx, nk * nn * (Nc / 16), 1, pack_b_f16_range, J);
-		else parallel_for(ctx, nk * nn * (Nc / G), 1, pack_b_range, J);
+		range_fn pb = pack_b_range;
+		if (J->cv == CV_F16 && G == 16) pb = pack_b_f16_range;
+		else if (J->cv == CV_BF16 && G == 16) pb = pack_b_bf16_range;
+		else if (J->cv == CV_I8 && G == 32) pb = pack_b_i8_range;
+		parallel_for(ctx, nk * nn * (Nc / G), 1, pb, J);
 	}
 	ctx->stats.pack_us += now_us() - t0;
 	buf_sync(ctx, &ctx->a, a_bytes, RKNPU_MEM_SYNC_TO_DEVICE);
@@ -885,7 +951,7 @@ static float *scratch(rk_ctx *ctx, int which, size_t n) {
 
 static float amax_all(rk_ctx *ctx, job_t *J, int rows, range_fn fn) {
 	J->amax_part = scratch(ctx, 0, (size_t)rows);
-	parallel_for(ctx, rows, 32, fn, J);
+	parallel_for(ctx, ceil_div(rows, 64), 1, fn, J);
 	float mx = 0.f;
 	for (int i = 0; i < rows; i++) if (J->amax_part[i] > mx) mx = J->amax_part[i];
 	return mx;
@@ -952,13 +1018,17 @@ int rk_gemm_ex(rk_ctx *ctx, int prec, int M, int N, int K,
 		J.dt = &DT_I8_I32;
 		J.cv = CV_I8;
 		t0 = now_us();
-		float *ra = scratch(ctx, 1, (size_t)M), *cb = scratch(ctx, 2, (size_t)N);
+		float *ra = scratch(ctx, 1, (size_t)M), *cb = scratch(ctx, 2, (size_t)2 * N);
 		amax_all(ctx, &J, M, amax_a_rows);
 		for (int m = 0; m < M; m++) ra[m] = J.amax_part[m] > 0.f ? 127.f / J.amax_part[m] : 1.f;
 		amax_all(ctx, &J, N, amax_b_cols);
-		for (int n = 0; n < N; n++) cb[n] = J.amax_part[n] > 0.f ? 127.f / J.amax_part[n] : 1.f;
+		for (int n = 0; n < N; n++) {
+			cb[n] = J.amax_part[n] > 0.f ? 127.f / J.amax_part[n] : 1.f;
+			cb[N + n] = 1.f / cb[n];
+		}
 		J.a_row = ra;
 		J.b_col = cb;
+		J.b_inv = cb + N;
 		ctx->stats.pack_us += now_us() - t0;
 		r = gemm_engine(ctx, &J);
 		break;
