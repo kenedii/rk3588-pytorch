@@ -161,6 +161,15 @@ def run():
         _line("ok" if err < 5e-3 else "fail", "self-test batched", f"rel err {err:.1e}")
     except Exception as e:  # noqa: BLE001
         _line("fail", "self-test batched", repr(e))
+    try:
+        x, w = torch.randn(2, 16, 20, 20), torch.randn(32, 16, 3, 3)
+        oc = ops._npu_conv(x, w, (2, 2), (1, 1), "fp16")
+        rc = torch.nn.functional.conv2d(x.double(), w.double(), stride=2, padding=1)
+        err = ((oc.double() - rc).norm() / rc.norm()).item()
+        _line("ok" if err < 5e-3 else "fail", "self-test conv2d", f"rel err {err:.1e}",
+              "" if err < 5e-3 else "convolutions will run on the CPU (npu_mode(conv=False) to skip them)")
+    except Exception as e:  # noqa: BLE001
+        _line("fail", "self-test conv2d", repr(e))
 
     # --- calibration ---
     from .calibrate import cached_threshold, NEVER
