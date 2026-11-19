@@ -375,6 +375,7 @@ experimenting:
 | `RKNPU_PRECISION` | `fp16` | default precision (`fp16`, `bf16`, `int8`, `fp16x3`, `fp16_out16`) |
 | `RKNPU_MIN_MACS` | calibrated | smallest op (multiply-adds) sent to the NPU; unset = measured on first use and cached in `~/.cache/rk3588_torch/` |
 | `RKNPU_VERIFY` | `first` | check each new shape against a CPU sample: `first`, `always`, or `off` |
+| `RKNPU_CHECK_FINITE` | `1` | send ops whose inputs contain inf/nan to the CPU (the NPU turns them into finite values, which would hide a diverging run); `0` saves one reduction per input (~5-10% on large GEMMs) |
 | `RKNPU_MAX_FAILURES` | `3` | NPU errors before it is disabled for the rest of the process |
 | `RKNPU_DISABLE` | `0` | `1` = run everything on the CPU (same code path, for A/B tests) |
 | `RKNPU_AUTOSCALE` | `1` | power-of-two scaling in `fp16` mode (`0` is ~15% faster, but values above 65504 overflow) |

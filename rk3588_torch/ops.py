@@ -37,6 +37,10 @@ VERIFY = os.environ.get("RKNPU_VERIFY", "first")
 # relative error allowed when checking an NPU result against the CPU, per precision
 VERIFY_TOL = {"fp16": 5e-3, "fp16_out16": 5e-3, "bf16": 3e-2, "int8": 8e-2, "fp16x3": 1e-4}
 MAX_FAILURES = int(os.environ.get("RKNPU_MAX_FAILURES", "3"))
+# The NPU does not propagate inf/nan: a non-finite input element yields *finite* garbage in its
+# row (every precision, and convolutions), which would hide a diverging run or a NaN gradient.
+# So inputs are checked first (one fast reduction each) and non-finite ones go to the CPU.
+CHECK_FINITE = os.environ.get("RKNPU_CHECK_FINITE", "1") not in ("0", "false", "no")
 
 _precision = os.environ.get("RKNPU_PRECISION", "fp16")
 if _precision not in PRECISIONS:
@@ -205,6 +209,8 @@ def gemm(a, b, precision=None, bias=None, relu=False, cache_b=None):
     status = _verified.get(key)
     if status is False:
         return _cpu_gemm(a, b, bias, relu)
+    if CHECK_FINITE and not (_all_finite(a) and _all_finite(b) and (bias is None or _all_finite(bias))):
+        return _cpu_gemm(a, b, bias, relu)
     wkey = 0
     if cache_b and b.dim() == 2 and b.dtype == torch.float32 and precision != "fp16x3":
         wkey = wcache.key_for(b, cache_b)
@@ -228,7 +234,9 @@ def gemm(a, b, precision=None, bias=None, relu=False, cache_b=None):
             _warn_once(("nonfinite", key), f"non-finite NPU output for shape {key[1]}x{key[2]} ({precision}); "
                                            "using the CPU for it")
             return _cpu_gemm(a, b, bias, relu)
-        return out   # garbage in, garbage out: same as the CPU would give
+        # non-finite inputs (only reachable with RKNPU_CHECK_FINITE=0): the NPU mangles inf/nan,
+        # so let the CPU produce PyTorch's exact result
+        return _cpu_gemm(a, b, bias, relu)
     if VERIFY == "always" or (VERIFY == "first" and status is None):
         ok = _check_sample(a, b, out, precision, bias, relu)
         _verified[key] = ok
@@ -399,7 +407,8 @@ def scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_caus
     sc = scale if scale is not None else 1.0 / math.sqrt(E)
     scores = bmm(q3, k3.transpose(1, 2)) * sc                                       # (B, L, S)
     if is_causal:
-        causal = torch.ones(L, S, dtype=torch.bool).tril(diagonal=S - L)
+        # same convention as PyTorch: top-left aligned, i.e. tril(diagonal=0) even when L != S
+        causal = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
         scores = scores.masked_fill(~causal, float("-inf"))
     if attn_mask is not None:
         m = attn_mask
@@ -551,6 +560,9 @@ def conv(x, w, stride=1, padding=0, precision=None, groups=1, bias=None, relu=Fa
     global _failures, _enabled
     precision = precision or _precision
     if precision not in ("fp16", "bf16"):
+        if precision == "fp16x3":
+            _warn_once("conv_prec", "convolutions have no fp16x3 path; they run in fp16 (use the CPU for "
+                                    "fp32-accurate convolutions)")
         precision = "fp16"                 # the conv path implements fp16 and bf16
     st, pd = _pair(stride), _pair(padding)
     macs = x.shape[0] * w.shape[0] * w.shape[1] * w.shape[2] * w.shape[3] * \
@@ -561,6 +573,8 @@ def conv(x, w, stride=1, padding=0, precision=None, groups=1, bias=None, relu=Fa
     key = ("conv", tuple(x.shape), tuple(w.shape), st, pd, groups, precision)
     status = _verified.get(key)
     if status is False:
+        return _cpu_conv(x, w, st, pd, groups, bias, relu)
+    if CHECK_FINITE and not (_all_finite(x) and _all_finite(w) and (bias is None or _all_finite(bias))):
         return _cpu_conv(x, w, st, pd, groups, bias, relu)
     wkey = wcache.key_for(w, cache_w) if cache_w and w.dtype == torch.float32 else 0
     try:
@@ -590,7 +604,7 @@ def conv(x, w, stride=1, padding=0, precision=None, groups=1, bias=None, relu=Fa
             den = ref.norm().item()
             ok = den == 0.0 or (out[:1, o_idx].double() - ref).norm().item() / den <= VERIFY_TOL[precision]
         if bad and not (_all_finite(x) and _all_finite(w)):
-            return out
+            return _cpu_conv(x, w, st, pd, groups, bias, relu)   # non-finite input: PyTorch's exact result
         _verified[key] = ok
         if not ok:
             _stats["rejected_shapes"] += 1

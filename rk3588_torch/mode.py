@@ -87,7 +87,7 @@ class NPUMode(TorchFunctionMode):
             if _tensors_ok(a, b) and a.dim() == 3 and _big_enough(a.shape[0] * a.shape[1] * b.shape[2] * a.shape[2]):
                 return ops.bmm(a, b)
             return None
-        if self.matmul and func in _ADDMM_FUNCS and len(args) == 3:
+        if self.matmul and func in _ADDMM_FUNCS and len(args) == 3 and kwargs.get("out") is None:
             inp, a, b = args
             beta, alpha = kwargs.get("beta", 1), kwargs.get("alpha", 1)
             if (_tensors_ok(inp, a, b) and a.dim() == 2 and b.dim() == 2
@@ -97,7 +97,7 @@ class NPUMode(TorchFunctionMode):
                     y = y * alpha
                 return y if beta == 0 else y + (inp if beta == 1 else inp * beta)
             return None
-        if self.matmul and func in _BADDBMM_FUNCS and len(args) == 3:
+        if self.matmul and func in _BADDBMM_FUNCS and len(args) == 3 and kwargs.get("out") is None:
             inp, a, b = args
             if (_tensors_ok(inp, a, b) and a.dim() == 3
                     and _big_enough(a.shape[0] * a.shape[1] * b.shape[2] * a.shape[2])):
