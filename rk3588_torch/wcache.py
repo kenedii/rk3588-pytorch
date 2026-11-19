@@ -9,7 +9,7 @@ A weight is cached once it has been used twice with the same values, so ordinary
 (weights change every step) never pays for caching. "Same values" is tracked by
 (storage address, PyTorch's in-place version counter, shape, strides, use) and confirmed on
 every hit by comparing a small sample of the tensor, which also catches updates that bypass
-the version counter (``p.data.add_(...)``). A strong reference to each cached tensor keeps its
+the version counter (``p.data.add_(...)``; one element of every row and column is compared). A strong reference to each cached tensor keeps its
 memory from being reused by another tensor while the entry exists.
 
 Environment: RKNPU_WCACHE=0 disables it; RKNPU_WCACHE_MB caps the NPU memory (default 256).
@@ -23,7 +23,7 @@ import torch
 
 ENABLED = os.environ.get("RKNPU_WCACHE", "1") not in ("0", "false", "no")
 MAX_ENTRIES = int(os.environ.get("RKNPU_WCACHE_ENTRIES", "512"))
-SAMPLE = 16                      # fingerprint = SAMPLE x SAMPLE elements
+SAMPLE = 4096                    # fingerprint: up to this many rows and this many columns
 
 _ids = itertools.count(1)
 _lock = threading.Lock()
@@ -34,10 +34,19 @@ _stats = {"hits": 0, "misses": 0, "stale": 0}
 
 
 def _fingerprint(t):
+    """One element from every row and one from every column (up to SAMPLE of each), at
+    scattered positions. An edit to whole rows or columns (p.data[i] = ..., p.data[:, j] *= ...)
+    therefore always changes the fingerprint, also on a transposed view; the old 16 x 16 grid
+    saw only 16 rows and 16 columns. At most 2 x SAMPLE elements: negligible next to a repack."""
     m = t if t.dim() == 2 else t.reshape(t.shape[0], -1)
-    r = torch.linspace(0, m.shape[0] - 1, min(SAMPLE, m.shape[0])).long()
-    c = torch.linspace(0, m.shape[1] - 1, min(SAMPLE, m.shape[1])).long()
-    return m.index_select(0, r).index_select(1, c).clone()
+    rows, cols = m.shape
+    r = torch.linspace(0, rows - 1, min(SAMPLE, rows)).long()
+    c = torch.linspace(0, cols - 1, min(SAMPLE, cols)).long()
+    # (i * odd) % n is a permutation of 0..n-1 when gcd(odd, n) == 1, so the partner indices
+    # are spread out rather than all on the diagonal or in column 0
+    rc = (r * 40503 + 7) % cols
+    cr = (c * 2654435761 + 3) % rows
+    return torch.cat([m[r, rc], m[cr, c]]).clone()
 
 
 def key_for(t, tag):
@@ -48,7 +57,9 @@ def key_for(t, tag):
     if t.dim() > 2 and not t.is_contiguous():
         return 0
     slot = (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype, tag)
-    sig = slot + (t._version,)
+    # tensors made under torch.inference_mode() have no version counter (t._version raises);
+    # for them the fingerprint alone detects changes
+    sig = slot + (-1 if t.is_inference() else t._version,)
     with _lock:
         ent = _entries.get(sig)
         if ent is not None:
