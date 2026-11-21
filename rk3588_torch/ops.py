@@ -42,6 +42,18 @@ MAX_FAILURES = int(os.environ.get("RKNPU_MAX_FAILURES", "3"))
 # So inputs are checked first (one fast reduction each) and non-finite ones go to the CPU.
 CHECK_FINITE = os.environ.get("RKNPU_CHECK_FINITE", "1") not in ("0", "false", "no")
 
+# bf16/fp16 operands are converted to fp32 for the NPU library. An operand pair whose fp32 copy would be
+# bigger than this many MB (an LLM's 150k-row embedding / lm_head, a huge logits gradient) is processed in
+# pieces instead, so one op never makes a gigabyte-sized temporary on a 4 GB board. 0 disables the split.
+CONVERT_MB = int(os.environ.get("RKNPU_CONVERT_MB", "128"))
+# First-use check of a new shape: a weight with more than VERIFY_MAX_ELEMS elements is checked on a strided
+# subset of VERIFY_COLS output columns (covering every tile) instead of converting all of it to fp64.
+VERIFY_MAX_ELEMS = 8_000_000
+VERIFY_COLS = 4096
+VERIFY_CHUNK_ELEMS = 4_000_000
+
+_CACHEABLE = (torch.float32, torch.bfloat16, torch.float16)
+
 _precision = os.environ.get("RKNPU_PRECISION", "fp16")
 if _precision not in PRECISIONS:
     raise ValueError(f"RKNPU_PRECISION={_precision!r}; choose from {sorted(PRECISIONS)}")
@@ -169,29 +181,79 @@ def _npu_gemm(a, b, precision, bias=None, relu=False, wkey=0):
 
 
 def _all_finite(t):
-    """One pass instead of isfinite().all()'s four: any NaN/inf makes the sum non-finite. Only
-    if the sum is non-finite (which a huge-but-finite sum could also cause) do the exact check."""
-    if math.isfinite(t.sum().item()):
+    """One pass instead of isfinite().all()'s four: any NaN/inf makes the sum non-finite (float16/bfloat16
+    are summed in fp32, without a copy). Only if the sum is non-finite (which a huge-but-finite sum could
+    also cause) do the exact check."""
+    s = t.sum() if t.dtype == torch.float32 else t.sum(dtype=torch.float32)
+    if math.isfinite(s.item()):
         return True
     return bool(torch.isfinite(t).all())
 
 
 def _check_sample(a, b, out, precision, bias=None, relu=False):
-    """Compare a few rows of the NPU result with an fp64 CPU reference."""
+    """Compare a few rows of the NPU result with an fp64 CPU reference. The reference is built in column
+    chunks (never an fp64 copy of the whole weight: a 150k x 896 lm_head would need over 1 GB), and for a
+    very large weight only on a strided subset of the output columns."""
     if a.dim() == 3:
         a, b, out = a[0], b[0] if b.dim() == 3 else b, out[0]
-    M = a.shape[0]
+    M, (K, N) = a.shape[0], b.shape
     idx = torch.unique(torch.linspace(0, M - 1, min(8, M)).round().long())
-    ref = a[idx].double() @ b.double()
-    if bias is not None:
-        ref = ref + bias.double()
+    ai = a[idx].double()
+    if K * N > VERIFY_MAX_ELEMS and N > VERIFY_COLS:
+        cols = torch.unique(torch.linspace(0, N - 1, VERIFY_COLS).round().long())
+        ref = ai @ b[:, cols].double()
+        got = out[idx][:, cols].double()
+        bias_d = None if bias is None else bias[cols].double()
+    else:
+        step = max(VERIFY_CHUNK_ELEMS // max(K, 1), 1)
+        ref = torch.cat([ai @ b[:, n0:n0 + step].double() for n0 in range(0, N, step)], 1)
+        got = out[idx].double()
+        bias_d = None if bias is None else bias.double()
+    if bias_d is not None:
+        ref = ref + bias_d
     if relu:
         ref = ref.clamp_min(0)
     den = ref.norm().item()
     if den == 0.0 or not math.isfinite(den):
         return True
-    err = (out[idx].double() - ref).norm().item() / den
+    err = (got - ref).norm().item() / den
     return err <= VERIFY_TOL[precision]
+
+
+def _convert_bytes(a, b):
+    """Bytes of fp32 temporaries _npu_gemm would make for bf16/fp16 operands."""
+    return 4 * ((a.numel() if a.dtype != torch.float32 else 0) + (b.numel() if b.dtype != torch.float32 else 0))
+
+
+def _gemm_split(a, b, precision, bias, relu):
+    """Split a GEMM whose low-precision operands would need a huge fp32 copy, along the dimension that
+    shrinks the biggest one (N or M, else K, which accumulates). Each half goes back through gemm(), so
+    it splits again if still too big. The pieces are not weight-cached (they are views of a weight that
+    is too big to cache anyway) and are verified by their own shapes. Returns None if it can't split."""
+    if a.dim() == 3:
+        if a.shape[0] > 1:
+            h = a.shape[0] // 2
+            return torch.cat([gemm(a[:h], b[:h], precision, bias, relu), gemm(a[h:], b[h:], precision, bias, relu)])
+        return gemm(a[0], b[0], precision, bias, relu).unsqueeze(0)
+    M, K = a.shape
+    N = b.shape[1]
+    ca = 4 * a.numel() if a.dtype != torch.float32 else 0
+    cb = 4 * b.numel() if b.dtype != torch.float32 else 0
+    dims = [("n", N), ("k", K)] if cb >= ca else [("m", M), ("k", K)]
+    dims.sort(key=lambda d: -d[1])
+    for name, size in dims:
+        if size < 2:
+            continue
+        h = size // 2
+        if name == "m":
+            return torch.cat([gemm(a[:h], b, precision, bias, relu), gemm(a[h:], b, precision, bias, relu)], 0)
+        if name == "n":
+            bl = None if bias is None else bias[:h]
+            br = None if bias is None else bias[h:]
+            return torch.cat([gemm(a, b[:, :h], precision, bl, relu), gemm(a, b[:, h:], precision, br, relu)], 1)
+        part = gemm(a[:, :h], b[:h], precision) + gemm(a[:, h:], b[h:], precision)
+        return _epilogue(part, bias, relu)
+    return None
 
 
 def gemm(a, b, precision=None, bias=None, relu=False, cache_b=None):
@@ -200,6 +262,10 @@ def gemm(a, b, precision=None, bias=None, relu=False, cache_b=None):
     which lets the packed-weight cache (wcache.py) keep its converted form between calls."""
     global _failures, _enabled
     precision = precision or _precision
+    if CONVERT_MB and a.dim() in (2, 3) and _convert_bytes(a, b) > CONVERT_MB << 20:
+        out = _gemm_split(a, b, precision, bias, relu)
+        if out is not None:
+            return out
     macs = a.numel() // a.shape[-1] * b.shape[-1] * a.shape[-1] if a.dim() == 2 else \
         a.shape[0] * a.shape[1] * b.shape[-1] * a.shape[2]
     if (not _enabled or macs < threshold(precision) or not _usable(a, b) or not npu_available()
@@ -209,11 +275,17 @@ def gemm(a, b, precision=None, bias=None, relu=False, cache_b=None):
     status = _verified.get(key)
     if status is False:
         return _cpu_gemm(a, b, bias, relu)
-    if CHECK_FINITE and not (_all_finite(a) and _all_finite(b) and (bias is None or _all_finite(bias))):
+    if CHECK_FINITE and not (_all_finite(a) and (bias is None or _all_finite(bias))):
         return _cpu_gemm(a, b, bias, relu)
-    wkey = 0
-    if cache_b and b.dim() == 2 and b.dtype == torch.float32 and precision != "fp16x3":
-        wkey = wcache.key_for(b, cache_b)
+    # a weight that is already in the cache was checked when it went in and hasn't changed since (the
+    # cache compares a fingerprint on every hit), so it isn't scanned again; fp32, bf16 and fp16 weights
+    # are all cacheable
+    wkey, b_ok = 0, False
+    if cache_b and b.dim() == 2 and b.dtype in _CACHEABLE and precision != "fp16x3":
+        wkey, b_ok = wcache.lookup(b, cache_b, check=_all_finite if CHECK_FINITE else None)
+        b_ok = b_ok or wkey != 0
+    if CHECK_FINITE and not b_ok and not _all_finite(b):
+        return _cpu_gemm(a, b, bias, relu)
     try:
         out = _npu_gemm(a, b, precision, bias, relu, wkey)
     except (RuntimeError, OSError) as e:
@@ -395,8 +467,17 @@ def baddbmm(inp, b1, b2, beta=1, alpha=1):
 
 def scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None,
                                  enable_gqa=False):
-    """SDPA as two batched NPU matmuls around a CPU softmax. Returns None if unsupported."""
-    if enable_gqa or q.dim() < 3 or q.shape[:-2] != k.shape[:-2] or k.shape[:-2] != v.shape[:-2]:
+    """SDPA as two batched NPU matmuls around a CPU softmax. Returns None if unsupported.
+    enable_gqa (grouped-query attention: fewer key/value heads than query heads, as in Llama, Qwen,
+    Mistral ...) repeats each key/value head for its group of query heads."""
+    if enable_gqa:
+        hq, hk = (q.shape[-3], k.shape[-3]) if q.dim() >= 4 and k.dim() >= 4 else (0, 0)
+        if hk == 0 or hq % hk or v.shape[-3] != hk:
+            return None
+        if hq != hk:
+            k = k.repeat_interleave(hq // hk, dim=-3)
+            v = v.repeat_interleave(hq // hk, dim=-3)
+    if q.dim() < 3 or q.shape[:-2] != k.shape[:-2] or k.shape[:-2] != v.shape[:-2]:
         return None
     lead = q.shape[:-2]
     L, E = q.shape[-2:]
@@ -405,7 +486,7 @@ def scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_caus
     k3 = k.reshape(-1, S, E)
     v3 = v.reshape(-1, S, Ev)
     sc = scale if scale is not None else 1.0 / math.sqrt(E)
-    scores = bmm(q3, k3.transpose(1, 2)) * sc                                       # (B, L, S)
+    scores = bmm(q3, k3.transpose(1, 2)).float() * sc                               # (B, L, S), fp32 softmax
     if is_causal:
         # same convention as PyTorch: top-left aligned, i.e. tril(diagonal=0) even when L != S
         causal = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
@@ -574,9 +655,14 @@ def conv(x, w, stride=1, padding=0, precision=None, groups=1, bias=None, relu=Fa
     status = _verified.get(key)
     if status is False:
         return _cpu_conv(x, w, st, pd, groups, bias, relu)
-    if CHECK_FINITE and not (_all_finite(x) and _all_finite(w) and (bias is None or _all_finite(bias))):
+    if CHECK_FINITE and not (_all_finite(x) and (bias is None or _all_finite(bias))):
         return _cpu_conv(x, w, st, pd, groups, bias, relu)
-    wkey = wcache.key_for(w, cache_w) if cache_w and w.dtype == torch.float32 else 0
+    wkey, w_ok = 0, False
+    if cache_w and w.dtype in _CACHEABLE:
+        wkey, w_ok = wcache.lookup(w, cache_w, check=_all_finite if CHECK_FINITE else None)
+        w_ok = w_ok or wkey != 0
+    if CHECK_FINITE and not w_ok and not _all_finite(w):
+        return _cpu_conv(x, w, st, pd, groups, bias, relu)
     try:
         out = _npu_conv(x, w, st, pd, precision, groups, bias, relu, wkey)
     except (RuntimeError, OSError) as e:

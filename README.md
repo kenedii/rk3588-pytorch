@@ -250,6 +250,47 @@ speed: its CPU-side splitting outweighs the NPU gain at these layer sizes.
 `tests/test_precision.py` checks every mode (60 checks, all passing), and
 `bench/bench_precision.py` produces the table above.
 
+## Fine-tuning large models
+
+LoRA and full fine-tuning of language models use a few things the small examples above don't:
+
+* **Frozen weights can stay in bf16 or fp16.** They go through the packed-weight cache like fp32 ones
+  (after the second use they are packed once and reused), so a 0.5B model needs half the RAM. Operands
+  too big to convert in one go (an embedding / `lm_head` of 150k rows, a huge logits gradient) are split
+  into pieces automatically so no single op makes a multi-gigabyte fp32 copy; `RKNPU_CONVERT_MB` (default
+  128) sets the piece size.
+* **bf16/fp16 ops that stay on the CPU are computed in fp32.** The RK3588's Cortex-A76 cores have no bf16
+  arithmetic, so PyTorch runs bf16 matmuls and attention on them through a very slow software path. Measured
+  on Qwen2.5-0.5B (bf16 weights, LoRA, 128 tokens): one attention call took 0.6 s and the small `k_proj`
+  linears 90 ms each, 29 s of a 45 s step. Under `npu_mode()` (and in `convert()`ed `NPULinear`) small ops that
+  don't reach the NPU are now widened to fp32 and the result is cast back, so autograd and dtypes are
+  unchanged: that step takes 11.7 s (2.9 to 11 tokens/s) with the same loss curve. `RKNPU_CPU_UPCAST=0`
+  turns it off; it is off automatically on a CPU that has native bf16.
+* **Grouped-query attention runs on the NPU.** `F.scaled_dot_product_attention(..., enable_gqa=True)` (Llama,
+  Qwen, Mistral and most recent LLMs) is routed like ordinary attention; each key/value head is repeated for its
+  query group. The softmax is done in fp32.
+* **Gradient checkpointing.** Re-running a layer inside `backward()` has to take the same path as the
+  forward pass. `backward()` inside the `npu_mode()` block works with any checkpoint function. If your
+  trainer calls `backward()` outside the block, either call `rk3588_torch.enable()` once at the start, or
+  use `rk3588_torch.checkpoint(layer, x)` in place of `torch.utils.checkpoint.checkpoint` (it remembers
+  the active `npu_mode()` and precision). Prefer non-reentrant checkpointing (the default of
+  `rk3588_torch.checkpoint`): reentrant checkpointing returns no gradients unless an input requires
+  grad, which an embedding lookup's input never does.
+* **The weight cache has a size.** Every frozen weight you reuse needs its packed copy in NPU memory
+  (`RKNPU_WCACHE_MB`, default 256). A 24-layer model has far more than that, so every step evicts and
+  re-packs most of them; the library warns once when that happens. `rk3588_torch.wcache.info()` shows
+  the estimate (`packed_estimate_mb` against `cap_mb`). Raise the cap if the board has memory to spare, but only to cover the whole estimate: with least-recently-used
+  eviction a loop that cycles through every layer gets no hits from a cache that holds only part of them
+  (Qwen2.5-0.5B needs about 1344 MB; at 640 MB the hit and miss counts and the step time were unchanged).
+* **Every new input shape is checked once.** The first call with a new GEMM shape is verified against
+  the CPU on a few rows (huge weights are checked on a strided sample of columns), so variable sequence
+  lengths pay that cost per length. Padding to a few fixed lengths keeps the number of shapes small.
+* **Weak power supplies.** A board that resets under sustained training is browning out. Lower the
+  load: `RKNPU_DUTY=0.6` (or `rk3588_torch.set_duty(0.6)`) pauses after each NPU call so the average draw
+  drops, `torch.set_num_threads(2)` with `RKNPU_THREADS=2` lowers the CPU side, and capping the clocks
+  helps further (e.g. `echo 600000000 | sudo tee /sys/class/devfreq/fdab0000.npu/max_freq`).
+  `python -m rk3588_torch doctor` prints the current limits. A 30 W+ USB-C PD supply is the real fix.
+
 ## How it works
 
 ```
@@ -350,6 +391,7 @@ Things that had to be discovered to make this work on a current kernel/driver:
 | `tests/test_precision.py` | Accuracy and range of every precision mode |
 | `tests/test_conv.py` | Native convolution forward/backward over many geometries (`--bench` for timing) |
 | `tests/test_new_ops.py` | conv1d, conv_transpose2d, grouped conv, einsum, fusion, weight cache (`--fake` runs without an NPU) |
+| `tests/test_llm_finetune.py` | bf16/fp16 frozen weights, bounded conversion memory, gradient checkpointing, weight-cache sizing, duty throttle (`--fake` runs without an NPU) |
 | `tests/test_robust.py` | Fallbacks, verification, batching, attention, `convert()`, `torch.compile`, tools |
 | `bench/bench_gemm.py` | CPU vs NPU GEMM throughput |
 | `bench/bench_precision.py` | Speed and error of every precision mode |
@@ -382,6 +424,9 @@ experimenting:
 | `RKNPU_THREADS` | `3` | CPU threads used for packing data for the NPU (pinned to the big cores) |
 | `RKNPU_MODE` | `2` | `2` = all three NPU cores, `1` = one core, `0` = one task per submit (debugging) |
 | `RKNPU_MAX_BUF_MB` | `512` | cap on NPU buffer memory; bigger ops are split |
+| `RKNPU_CONVERT_MB` | `128` | an op whose bf16/fp16 operands would need more than this many MB of fp32 copies (a 150k-row `lm_head`, huge logits gradients) is split into pieces; `0` = never split |
+| `RKNPU_CPU_UPCAST` | `1` | compute small bf16/fp16 matmuls, linears and attention that stay on the CPU in fp32 (the A76 has no bf16 arithmetic); `0` = leave them to PyTorch |
+| `RKNPU_DUTY` | `1.0` | share of wall time the NPU path may be busy (0.05 to 1); below 1 every NPU call is followed by a proportional pause, for supplies that brown out under sustained load. Also `rk3588_torch.set_duty()` |
 | `RKNPU_WCACHE` | `1` | `0` turns off the packed-weight cache |
 | `RKNPU_WCACHE_MB` | `256` | NPU memory for cached weights (least recently used are evicted) |
 | `RKNPU_LOCK` | `1` | serialize NPU use across processes that use this library (`/tmp/rk3588_torch.lock`) |
@@ -414,9 +459,13 @@ is handy for developing on a PC.
 | `could not open the rknpu DRM device` | load the driver: `sudo modprobe rknpu`, and check `dmesg \| grep -i rknpu` |
 | permission denied on `/dev/dri/card*` | `sudo usermod -aG video,render $USER`, then log out and back in |
 | `librknpu_gemm.so not found` | `pip install .` from the repo (or `make -C csrc` and run from the repo) |
-| board resets or freezes under load | use a 30 W+ USB-C PD supply, and `torch.set_num_threads(3)` |
+| board resets or freezes under load | use a 30 W+ USB-C PD supply, and `torch.set_num_threads(3)`. On a weak supply, also `RKNPU_DUTY=0.6`, 2 threads, and optionally cap the NPU clock (see [Fine-tuning large models](#fine-tuning-large-models)) |
+| `CheckpointError: Recomputed values ... different metadata` | gradient checkpointing re-ran a layer without the NPU routing. Use `rk3588_torch.checkpoint(...)` instead of `torch.utils.checkpoint.checkpoint`, or call `rk3588_torch.enable()` once; see [Fine-tuning large models](#fine-tuning-large-models) |
+| warning: "weight cache ... capped at ... MB" | the frozen weights you reuse don't fit the cache, so each step re-packs them. Raise `RKNPU_WCACHE_MB` if memory allows (`rk3588_torch.wcache.info()` shows the numbers) |
 | warning: "NPU failed ... running on the CPU" | an NPU job timed out or errored; that op ran on the CPU. After `RKNPU_MAX_FAILURES` the NPU is disabled for the process. Check `dmesg` for `RKNPU` lines |
 | warning: "didn't match the CPU check" | that shape gave a wrong NPU result and is pinned to the CPU. Please open an issue with the shape |
+| bf16 training is slow and `profile()` shows `aten::addmm` / `_scaled_dot_product_flash_attention` taking seconds | bf16 on the A76 CPU is a software path. Keep `RKNPU_CPU_UPCAST=1` (default), and make sure attention goes through `F.scaled_dot_product_attention` inside `npu_mode()` |
+| a power loss leaves files of zero size | ext4 can lose recently written files on a reset. Run `sync` after copying code to the board |
 | training is no faster | run `compare()` / `profile()`: small layers stay on the CPU by design, and CPU-side ops (norms, activations, pooling) may dominate |
 | loss is NaN only on the NPU | try `precision="bf16"` (fp32 range) or `fp16x3` (fp32 accuracy) |
 | another NPU program (e.g. an LLM server) misbehaves | a hung job makes the driver reset every NPU core; run experiments when it's idle |

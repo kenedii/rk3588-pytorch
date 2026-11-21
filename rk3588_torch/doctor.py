@@ -138,6 +138,22 @@ def run():
         _line("info", "NPU frequency governor", gov,
               "for steady benchmarks: echo performance | sudo tee /sys/class/devfreq/fdab0000.npu/governor")
 
+    # --- power ---
+    npu_cap = _read("/sys/class/devfreq/fdab0000.npu/max_freq")
+    big = _read("/sys/devices/system/cpu/cpu4/cpufreq/scaling_max_freq")
+    from ._lib import get_duty
+    parts = []
+    if npu_cap:
+        parts.append(f"NPU max {int(npu_cap) // 10**6} MHz")
+    if big:
+        parts.append(f"big cores max {int(big) // 1000} MHz")
+    parts += [f"RKNPU_DUTY={get_duty():g}", f"{torch.get_num_threads()} torch threads"]
+    _line("info", "power limits", ", ".join(parts))
+    _line("info", "weak charger?", "if the board resets or reboots under sustained training, it is browning out",
+          "lower the load: RKNPU_DUTY=0.6 (or rk3588_torch.set_duty(0.6)), torch.set_num_threads(2) with "
+          "RKNPU_THREADS=2, and optionally cap the clocks, e.g. "
+          "echo 600000000 | sudo tee /sys/class/devfreq/fdab0000.npu/max_freq; a 30 W+ USB-C PD supply fixes it")
+
     # --- self test ---
     from . import ops
     from ._lib import PRECISIONS

@@ -17,12 +17,16 @@ Environment: RKNPU_WCACHE=0 disables it; RKNPU_WCACHE_MB caps the NPU memory (de
 import itertools
 import os
 import threading
+import warnings
 from collections import OrderedDict
 
 import torch
 
 ENABLED = os.environ.get("RKNPU_WCACHE", "1") not in ("0", "false", "no")
 MAX_ENTRIES = int(os.environ.get("RKNPU_WCACHE_ENTRIES", "512"))
+# NPU memory the library keeps for packed weights (it evicts the least recently used beyond this);
+# mirrors RKNPU_WCACHE_MB / NPU.set_wcache_mb so the module can tell when the weights in use don't fit
+CAP_MB = int(os.environ.get("RKNPU_WCACHE_MB", "256"))
 SAMPLE = 4096                    # fingerprint: up to this many rows and this many columns
 
 _ids = itertools.count(1)
@@ -31,6 +35,7 @@ _seen = OrderedDict()            # signature -> times seen (not cached yet)
 _entries = OrderedDict()         # signature -> (key, tensor, fingerprint)
 _by_slot = {}                    # signature without the version -> signature (to drop old versions)
 _stats = {"hits": 0, "misses": 0, "stale": 0}
+_warned_cap = False
 
 
 def _fingerprint(t):
@@ -49,13 +54,38 @@ def _fingerprint(t):
     return torch.cat([m[r, rc], m[cr, c]]).clone()
 
 
-def key_for(t, tag):
-    """Cache key (int) for weight tensor `t` used as `tag`, or 0 if it shouldn't be cached
-    (yet). Call with the NPU about to consume `t` as its weight operand."""
+def _packed_estimate(t):
+    """Rough NPU bytes of t's packed (fp16/bf16, padded to 32) form."""
+    if t.dim() == 2:
+        return 2 * (-(-t.shape[0] // 32) * 32) * (-(-t.shape[1] // 32) * 32)
+    return 2 * t.numel()
+
+
+def _warn_if_over_cap():
+    global _warned_cap
+    if _warned_cap:
+        return
+    total = sum(_packed_estimate(e[1]) for e in _entries.values())
+    if total > CAP_MB << 20:
+        _warned_cap = True
+        warnings.warn(
+            f"rk3588_torch: the {len(_entries)} weights reused across NPU calls need about {total >> 20} MB "
+            f"packed, but the weight cache is capped at {CAP_MB} MB (RKNPU_WCACHE_MB). When a loop cycles "
+            "through more weights than fit, least-recently-used eviction makes every weight miss on every "
+            "step, so the cache costs time instead of saving it. Raise RKNPU_WCACHE_MB if the board has "
+            "memory to spare, or set RKNPU_WCACHE=0.", RuntimeWarning, stacklevel=4)
+
+
+def lookup(t, tag, check=None):
+    """Cache key (int) for weight tensor `t` used as `tag`, or 0 if it shouldn't be cached (yet), and
+    whether that key was already in the cache (True: `t` is unchanged since it went in, so whatever was
+    verified about it then still holds). `check(t)` (e.g. a finite-values test) runs once, just before a
+    weight is first entered; if it returns False the weight is not cached. Call with the NPU about to
+    consume `t` as its weight operand. float32, bfloat16 and float16 weights are cacheable."""
     if not ENABLED or t.dim() < 2 or t.numel() == 0:
-        return 0
+        return 0, False
     if t.dim() > 2 and not t.is_contiguous():
-        return 0
+        return 0, False
     slot = (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype, tag)
     # tensors made under torch.inference_mode() have no version counter (t._version raises);
     # for them the fingerprint alone detects changes
@@ -67,7 +97,7 @@ def key_for(t, tag):
             if torch.equal(_fingerprint(t), fp):
                 _entries.move_to_end(sig)
                 _stats["hits"] += 1
-                return key
+                return key, True
             _stats["stale"] += 1           # changed without a version bump: repack
             _drop(sig)
         old = _by_slot.get(slot)
@@ -79,14 +109,23 @@ def key_for(t, tag):
             while len(_seen) > 4 * MAX_ENTRIES:
                 _seen.popitem(last=False)
             _stats["misses"] += 1
-            return 0
+            return 0, False
+        if check is not None and not check(t):
+            _seen[sig] = n
+            return 0, False
         key = next(_ids)
         _entries[sig] = (key, t, _fingerprint(t))
         _by_slot[slot] = sig
         while len(_entries) > MAX_ENTRIES:
             _drop(next(iter(_entries)))
         _stats["misses"] += 1
-        return key
+        _warn_if_over_cap()
+        return key, False
+
+
+def key_for(t, tag):
+    """lookup() without the hit flag: the cache key for `t`, or 0."""
+    return lookup(t, tag)[0]
 
 
 def _drop(sig):
@@ -104,6 +143,8 @@ def _drop(sig):
 
 def clear():
     """Forget every cached weight (frees their NPU memory)."""
+    global _warned_cap
+    _warned_cap = False
     with _lock:
         for sig in list(_entries):
             _drop(sig)
@@ -111,7 +152,8 @@ def clear():
 
 
 def info():
-    out = dict(_stats, entries=len(_entries))
+    out = dict(_stats, entries=len(_entries), packed_estimate_mb=sum(_packed_estimate(e[1]) for e in _entries.values()) >> 20,
+               cap_mb=CAP_MB)
     try:
         from ._lib import default_npu
         out.update({"npu_" + k: v for k, v in default_npu().wcache_info().items()})
