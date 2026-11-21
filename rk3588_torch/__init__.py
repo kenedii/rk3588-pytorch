@@ -14,9 +14,9 @@ else stays on the CPU. Anything the NPU can't do, or does too slowly, falls back
 """
 __version__ = "0.4.0"
 
-from ._lib import NPU, PRECISIONS, default_npu, npu_available, npu_error
-from .mode import (NPUConv1d, NPUConv2d, NPUConvTranspose2d, NPULinear, NPUMode, convert, disable, enable,
-                   npu_mode)
+from ._lib import NPU, PRECISIONS, default_npu, get_duty, npu_available, npu_error, set_duty
+from .mode import (NPUConv1d, NPUConv2d, NPUConvTranspose2d, NPULinear, NPUMode, checkpoint, convert, disable,
+                   enable, npu_mode)
 from . import wcache
 from .ops import (bmm, conv1d, conv2d, conv_transpose2d, einsum, get_precision, gemm, is_enabled, linear, matmul,
                   mm_raw, release, reset_verification, scaled_dot_product_attention, set_enabled, set_precision, stats,
@@ -25,7 +25,7 @@ from .tools import compare, profile
 from .calibrate import calibrate
 
 __all__ = ["NPU", "PRECISIONS", "default_npu", "npu_available", "npu_error",
-           "NPUConv1d", "NPUConv2d", "NPUConvTranspose2d", "NPULinear", "NPUMode", "convert", "disable", "enable",
+           "checkpoint", "get_duty", "set_duty", "NPUConv1d", "NPUConv2d", "NPUConvTranspose2d", "NPULinear", "NPUMode", "convert", "disable", "enable",
            "npu_mode", "bmm", "conv1d", "conv2d", "conv_transpose2d", "einsum", "wcache", "get_precision", "gemm",
            "is_enabled", "linear", "matmul", "mm_raw", "release",
            "reset_verification", "scaled_dot_product_attention", "set_enabled", "set_precision", "stats",

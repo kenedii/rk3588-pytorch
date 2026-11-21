@@ -11,6 +11,9 @@ CPU. Convolutions use the NPU's native convolution engine (dilation 1; grouped c
 when the groups aren't too thin; depthwise ones stay on the CPU). Biases are added in the
 NPU library's output stage. If no NPU is available everything simply runs on the CPU.
 """
+import os
+import threading
+
 import torch
 import torch.nn.functional as F
 from torch.overrides import TorchFunctionMode
@@ -23,6 +26,94 @@ _ADDMM_FUNCS = {torch.addmm, torch.Tensor.addmm}
 _BADDBMM_FUNCS = {torch.baddbmm, torch.Tensor.baddbmm}
 _SDPA = getattr(F, "scaled_dot_product_attention", None)
 _EINSUM = {torch.einsum, torch.functional.einsum} if hasattr(torch, "functional") else {torch.einsum}
+
+
+_UPCAST_FUNCS = (_MM_FUNCS | _BMM_FUNCS | _ADDMM_FUNCS | _BADDBMM_FUNCS | _EINSUM | {F.linear}
+                 | ({_SDPA} if _SDPA is not None else set()))
+
+
+def _cpu_has_bf16():
+    """True if the CPU has native bf16 arithmetic (aarch64 'bf16' feature flag). The RK3588's A76 cores don't."""
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.lower().startswith(("features", "flags")):
+                    return "bf16" in line.split() or "avx512_bf16" in line.split()
+    except OSError:
+        pass
+    return True          # unknown: leave PyTorch alone
+
+
+# bf16/fp16 matmuls, attention and linear layers that stay on the CPU (below the NPU threshold, or not
+# supported) run through slow software paths on a CPU without bf16 arithmetic: a 128-token attention call took
+# 0.6 s, a small addmm 90 ms. Computing them in fp32 and casting the result back is many times faster
+# and autograd follows the casts. RKNPU_CPU_UPCAST=0 turns it off.
+_UPCAST = os.environ.get("RKNPU_CPU_UPCAST", "1") != "0" and not _cpu_has_bf16()
+_UPCAST_DEFAULT = _UPCAST
+_LOWP = (torch.bfloat16, torch.float16)
+
+
+def _upcast_call(func, args, kwargs, force=False):
+    """Run `func` in fp32 if its floating-point tensors are all bf16 (or all fp16) on the CPU and small enough
+    to widen; returns the result in the original dtype, or None when this doesn't apply."""
+    if not (_UPCAST or force) or kwargs.get("out") is not None:
+        return None
+    ts = [a for a in list(args) + list(kwargs.values()) if isinstance(a, torch.Tensor)]
+    if any(isinstance(a, (list, tuple)) and any(isinstance(x, torch.Tensor) for x in a) for a in args):
+        return None
+    fl = {t.dtype for t in ts if t.is_floating_point()}
+    if len(fl) != 1 or next(iter(fl)) not in _LOWP or any(t.device.type != "cpu" for t in ts):
+        return None
+    if ops.CONVERT_MB and sum(t.numel() for t in ts if t.is_floating_point()) * 4 > ops.CONVERT_MB << 20:
+        return None
+    dt = next(iter(fl))
+
+    def wide(x):
+        return x.float() if isinstance(x, torch.Tensor) and x.is_floating_point() else x
+    out = func(*[wide(a) for a in args], **{k: wide(v) for k, v in kwargs.items()})
+    return out.to(dt) if isinstance(out, torch.Tensor) and out.is_floating_point() else out
+
+
+_BACKWARD_FUNCS = (torch.Tensor.backward, torch.autograd.backward)
+_bw = threading.local()
+_orig_engine_run = None
+
+
+def _install_engine_wrapper():
+    """Wrap torch.autograd's engine call once so it can run with an npu_mode() back on the mode stack."""
+    global _orig_engine_run
+    import torch.autograd as ag
+    if _orig_engine_run is not None or not hasattr(ag, "_engine_run_backward"):
+        return _orig_engine_run is not None
+    _orig_engine_run = ag._engine_run_backward
+
+    def wrapped(*a, **k):
+        m = getattr(_bw, "mode", None)
+        if m is None:
+            return _orig_engine_run(*a, **k)
+        TorchFunctionMode.__enter__(m)
+        try:
+            return _orig_engine_run(*a, **k)
+        finally:
+            TorchFunctionMode.__exit__(m, None, None, None)
+    ag._engine_run_backward = wrapped
+    return True
+
+
+def _run_backward_in_mode(mode, func, args, kwargs):
+    """loss.backward() is itself a torch function, so PyTorch takes the mode off the stack while handling
+    it. Everything backward() re-runs (gradient checkpointing's recompute) would then miss the NPU routing
+    the forward pass had, save different tensors, and fail the checkpoint's metadata check. Run the
+    backward pass with the mode back on the stack. (Only if this PyTorch has the engine hook we wrap;
+    otherwise backward runs as before and rk3588_torch.checkpoint covers checkpointing.)"""
+    if not _install_engine_wrapper():
+        return func(*args, **kwargs)
+    prev = getattr(_bw, "mode", None)
+    _bw.mode = mode
+    try:
+        return func(*args, **kwargs)
+    finally:
+        _bw.mode = prev
 
 
 def _tensors_ok(*ts):
@@ -62,8 +153,14 @@ class NPUMode(TorchFunctionMode):
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
+        if func in _BACKWARD_FUNCS:
+            return _run_backward_in_mode(self, func, args, kwargs)
         if ops._enabled:
             out = self._route(func, args, kwargs)
+            if out is not None:
+                return out
+        if func in _UPCAST_FUNCS:
+            out = _upcast_call(func, args, kwargs)
             if out is not None:
                 return out
         return func(*args, **kwargs)
@@ -153,6 +250,44 @@ def npu_mode(**kw):
     return NPUMode(**kw)
 
 
+def _modes_on_stack():
+    try:
+        return list(torch.overrides._get_current_function_mode_stack())
+    except AttributeError:        # very old PyTorch: no way to look
+        return []
+
+
+def checkpoint(function, *args, use_reentrant=False, **kwargs):
+    """torch.utils.checkpoint.checkpoint that keeps working with the NPU.
+
+    Gradient checkpointing re-runs `function` inside backward(). That re-run must take the same path as
+    the forward pass, or non-reentrant checkpointing stops with "recomputed tensors have different
+    metadata" (the NPU path saves the weight untransposed, the plain PyTorch path saves it transposed).
+    npu_mode() itself now stays active through a backward() called inside its with-block; this wrapper
+    additionally covers a backward() called outside the block (a Trainer loop, an accelerator): it
+    remembers the active npu_mode() settings, including the precision, and re-enters them for the
+    re-run. (Alternatively call rk3588_torch.enable() once and use any checkpoint function.) Without
+    an active npu_mode() it is just torch.utils.checkpoint.checkpoint.
+
+    It defaults to use_reentrant=False. The reentrant variant (use_reentrant=True) gives no gradients
+    unless at least one input tensor requires grad, which is awkward when the first layer's input is
+    an embedding lookup or a batch of token ids.
+    """
+    from torch.utils.checkpoint import checkpoint as _ckpt
+    cur = next((m for m in reversed(_modes_on_stack()) if isinstance(m, NPUMode)), None)
+    if cur is None:
+        return _ckpt(function, *args, use_reentrant=use_reentrant, **kwargs)
+    cfg = dict(linear=cur.linear, matmul=cur.matmul, attention=cur.attention, conv=cur.conv,
+               precision=ops.get_precision(), calibrate=False)
+
+    def run(*a, **k):
+        if any(isinstance(m, NPUMode) for m in _modes_on_stack()):     # same routing as the forward pass
+            return function(*a, **k)
+        with NPUMode(**cfg):         # backward() outside the block: recompute the way the forward ran
+            return function(*a, **k)
+    return _ckpt(run, *args, use_reentrant=use_reentrant, **kwargs)
+
+
 _global_mode = None
 
 
@@ -182,7 +317,9 @@ class NPULinear(torch.nn.Linear):
         if (ops._enabled and ops._usable(x, self.weight) and (self.bias is None or ops._usable(self.bias))
                 and x.numel() // max(x.shape[-1], 1) * self.weight.shape[0] * self.weight.shape[1] >= ops.threshold()):
             return ops.linear(x, self.weight, self.bias, act)
-        y = F.linear(x, self.weight, self.bias)
+        y = _upcast_call(F.linear, (x, self.weight, self.bias), {})
+        if y is None:
+            y = F.linear(x, self.weight, self.bias)
         return F.relu(y) if self.fused_relu else y
 
 

@@ -2,6 +2,7 @@
 import ctypes
 import os
 import threading
+import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CANDIDATES = [
@@ -9,6 +10,29 @@ _CANDIDATES = [
     os.path.join(_HERE, "librknpu_gemm.so"),
     os.path.join(_HERE, "..", "csrc", "librknpu_gemm.so"),
 ]
+
+# Fraction of wall time the NPU path may be busy (NPU job plus the CPU packing around it), 0 < d <= 1.
+# Below 1, every NPU call is followed by a pause of busy * (1/d - 1): the board draws less on average and
+# gets breathing room between bursts, for supplies that brown out under sustained all-out load
+# (RKNPU_DUTY, set_duty()). Pair it with fewer threads (RKNPU_THREADS, torch.set_num_threads).
+_duty = min(max(float(os.environ.get("RKNPU_DUTY", "1.0")), 0.05), 1.0)
+
+
+def set_duty(d):
+    """Limit the NPU duty cycle to d (0.05 .. 1.0); returns the previous value."""
+    global _duty
+    prev, _duty = _duty, min(max(float(d), 0.05), 1.0)
+    return prev
+
+
+def get_duty():
+    return _duty
+
+
+def _throttle(busy_s):
+    if _duty < 1.0 and busy_s > 0:
+        time.sleep(busy_s * (1.0 / _duty - 1.0))
+
 
 # precision names -> rk_gemm_ex codes (see csrc/rknpu_gemm.h)
 PRECISIONS = {"fp16": 0, "fp16_out16": 1, "int8": 2, "fp16x3": 3, "bf16": 4}
@@ -143,6 +167,7 @@ class NPU:
                 self.lib.rk_set_epilogue(self.ctx, bias_ptr or None, 1 if relu else 0)
             if wkey:
                 self.lib.rk_set_wcache_key(self.ctx, wkey)
+            t0 = time.perf_counter()
             try:
                 r = fn(self.ctx, *args)
             finally:
@@ -152,6 +177,7 @@ class NPU:
                     self.lib.rk_set_wcache_key(self.ctx, 0)
             if r != 0:
                 raise RuntimeError(f"rknpu {fn.__name__[3:]} failed: " + self.lib.rk_last_error(self.ctx).decode())
+            _throttle(time.perf_counter() - t0)
 
     def gemm(self, batch, M, N, K, a_ptr, sa_b, sa_m, sa_k, b_ptr, sb_b, sb_k, sb_n, c_ptr, sc_b, ldc,
              accumulate=False, precision="fp16", bias_ptr=0, relu=False, wkey=0):
@@ -178,6 +204,8 @@ class NPU:
         return {"bytes": int(self.lib.rk_wcache_bytes(self.ctx)), "entries": int(self.lib.rk_wcache_entries(self.ctx))}
 
     def set_wcache_mb(self, mb):
+        from . import wcache
+        wcache.CAP_MB = int(mb)
         with self.lock:
             self.lib.rk_set_wcache_mb(self.ctx, int(mb))
 
