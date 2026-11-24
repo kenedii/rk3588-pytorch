@@ -429,6 +429,18 @@ Things that had to be discovered to make this work on a current kernel/driver:
   flash attention was faster for every head dim up to 64 (by 10-60%, lengths 65-1024); at head dim 128
   the NPU wins. So by default attention goes to the NPU only from head dim 128 (`RKNPU_ATTENTION`); this
   alone took GPT from 1.65x to 1.93x and ViT from 1.33x to 1.74x per training step.
+* **The NPU is often DRAM-bound, so the K split is planned.** The CBUF (384 KB) holds a tile of A rows and
+  either all of the weights or a streamed slice of them. With a long K (e.g. 8192) only a dozen rows of A fit,
+  so the whole weight matrix is re-read from DRAM for every dozen rows: the DDR controller's counters
+  (`rockchip_ddr` PMU) show the NPU pulling 16-20 GB/s of the LPDDR4X's ~34 GB/s. Splitting K into chunks
+  makes the row tiles taller and the weight traffic proportionally smaller, at the price of fp32 partial sums
+  that the CPU adds up. A small cost model (NPU time = max(MACs / 680 G/s, bytes / 20 GB/s) + the CPU
+  reduction) picks the split per GEMM: 2048 x 8192 x 2048 went from 609 ms to 85 ms, 4096 x 4096 x 1024 from
+  75 ms to 51 ms; compute-bound shapes such as 2048^3 keep a single chunk.
+* **Overlapping the CPU and the NPU doesn't pay here.** `RKNPU_PIPELINE=n` splits a GEMM into up to n waves
+  and packs wave i+1 while the NPU runs wave i. It works, but it hardly helps: the packing and the NPU share
+  the same DRAM, and the NPU slows down as much as the CPU work is hidden (13 -> 20 ms NPU time on the LM
+  head shape). Off by default.
 * **Two convolution padding errata.** With 2+ rows of zero padding, (a) a task that reuses the
   weights already in CBUF from the previous task (`WEIGHT_REUSE`) computes wrong results for every
   second image, and (b) independently, the first output rows of the first 16-kernel group come out
@@ -479,6 +491,7 @@ Things that had to be discovered to make this work on a current kernel/driver:
 | `bench/bench_gemm.py` | CPU vs NPU GEMM throughput |
 | `bench/bench_precision.py` | Speed and error of every precision mode |
 | `bench/bench_models.py` | MLP / CNN / ResNet / Transformer training steps, CPU vs NPU |
+| `bench/bench_eltwise.py` | CPU cost of the element-wise ops of a training step (GELU, norms, softmax, ...) |
 | `bench/bench_layouts.py` | time breakdown (pack / sync / NPU / unpack) of a linear layer's three training GEMMs |
 | `bench/bench_new_ops.py` | fusion, weight cache (inference, LoRA), conv_transpose2d, grouped conv, conv1d, einsum |
 | `examples/train_mnist.py` | MLP / CNN training on NPU vs CPU |
@@ -505,6 +518,8 @@ experimenting:
 | `RKNPU_MAX_FAILURES` | `3` | NPU errors before it is disabled for the rest of the process |
 | `RKNPU_DISABLE` | `0` | `1` = run everything on the CPU (same code path, for A/B tests) |
 | `RKNPU_AUTOSCALE` | `2` | power-of-two scaling in `fp16` mode: `2` optimistic (pack at scale 1, rescale only operands outside [2^-10, 65504]), `1` always scan first, `0` off (values above 65504 overflow) |
+| `RKNPU_KPLAN` | `1` | choose each GEMM's K split with the DRAM/compute cost model (`0`: one chunk up to `RKNPU_MAX_K`); `RKNPU_PLAN_GMACS` / `_NPU_GBS` / `_CPU_GBS` (680 / 20 / 3) are its constants |
+| `RKNPU_PIPELINE` | `1` | waves to split a GEMM into to overlap CPU packing with the NPU (1 = off; see How it works) |
 | `RKNPU_ATTENTION` | `auto` | where the attention GEMMs run: `auto` = NPU only for head dim >= 128 (PyTorch's fused CPU flash attention is faster below that), `npu` = always, `cpu` = never. Projections always use the NPU |
 | `RKNPU_HW_PAD_MAX` | `1` | largest convolution padding left to the NPU; larger padding is applied on the CPU first (works around a hardware erratum, see How it works) |
 | `RKNPU_IM2COL_MAX_MB` | `256` | largest unfolded input for convolutions run as unfold + GEMM (feature maps under 5 rows, padding > 15, ...) |

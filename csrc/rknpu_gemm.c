@@ -82,6 +82,10 @@ struct rk_ctx {
 	int      timeout_ms;
 	int      reuse;
 	int      pingpong;         /* RKNPU_JOB_PINGPONG on submits (RKNPU_PINGPONG, default 1) */
+	int      kplan;            /* choose the K split with the cost model (RKNPU_KPLAN, default 1) */
+	int      plan_peak_gmacs, plan_npu_gbs, plan_cpu_gbs;
+	int      pipeline;         /* max waves a GEMM is split into to overlap CPU and NPU (RKNPU_PIPELINE, 0/1 = off) */
+	long     pipeline_min;     /* only for GEMMs with M*K + M*N >= this (RKNPU_PIPELINE_MIN) */
 	struct pool *pool;
 	int      autoscale;
 	int      lock_fd;          /* cross-process lock (flock) or -1 */
@@ -157,6 +161,13 @@ rk_ctx *rk_open(const char *dev) {
 	ctx->timeout_ms = env_int("RKNPU_TIMEOUT_MS", 3000);
 	ctx->reuse = env_int("RKNPU_WEIGHT_REUSE", 1);
 	ctx->pingpong = env_int("RKNPU_PINGPONG", 1);
+	ctx->kplan = env_int("RKNPU_KPLAN", 1);
+	ctx->plan_peak_gmacs = env_int("RKNPU_PLAN_GMACS", 680);   /* 3-core fp16 MAC rate, measured */
+	ctx->plan_npu_gbs = env_int("RKNPU_PLAN_NPU_GBS", 20);     /* NPU DRAM traffic rate, ddrbw-measured */
+	ctx->plan_cpu_gbs = env_int("RKNPU_PLAN_CPU_GBS", 3);      /* CPU partial-sum reduction rate */
+	ctx->pipeline = env_int("RKNPU_PIPELINE", 1);
+	if (ctx->pipeline > 64) ctx->pipeline = 64;
+	ctx->pipeline_min = env_int("RKNPU_PIPELINE_MIN", 1 << 20);
 	ctx->autoscale = env_int("RKNPU_AUTOSCALE", 2);   /* 0 off, 1 always scan, 2 optimistic (see gemm_front) */
 	ctx->max_buf = (size_t)env_int("RKNPU_MAX_BUF_MB", 512) << 20;
 	ctx->wc_max = (size_t)env_int("RKNPU_WCACHE_MB", 256) << 20;
@@ -357,6 +368,14 @@ static int buf_ensure(rk_ctx *ctx, rk_buf *b, size_t size, uint32_t flags) {
 		ioctl(ctx->fd, DRM_IOCTL_RKNPU_MEM_SYNC, &sy);
 	}
 	return 0;
+}
+
+static void buf_sync_range(rk_ctx *ctx, rk_buf *b, size_t off, size_t size, uint32_t dir) {
+	if (!(b->flags & RKNPU_MEM_CACHEABLE) || !size) return;
+	double t0 = now_us();
+	struct rknpu_mem_sync s = { .flags = dir, .obj_addr = b->obj, .offset = off, .size = size };
+	ioctl(ctx->fd, DRM_IOCTL_RKNPU_MEM_SYNC, &s);
+	ctx->stats.sync_us += now_us() - t0;
 }
 
 static void buf_sync(rk_ctx *ctx, rk_buf *b, size_t size, uint32_t dir) {
@@ -788,6 +807,7 @@ typedef struct {
 	int relu_dpu;                         /* the ReLU already ran in the DPU */
 	struct wc_entry *wc;                  /* cached packed B (or NULL) */
 	int opt_a, opt_b;                     /* fp16 optimistic scaling: packed at scale 1, range checked after */
+	int row_lo, row_hi;                   /* amax_a_rows row window (row_hi 0 = all rows) */
 } job_t;
 
 /* write one converted element of A row m / B column n */
@@ -1024,6 +1044,26 @@ static void unpack_core(void *v, int b, int e) {
 		}
 		return;
 	}
+	if (ob == PREC_FP32 && !J->accumulate) {
+		/* K split into nk chunks: sum the chunks' fp32 partial tiles, contiguous along n (vectorizes) */
+		const float mul = J->out_mul;
+		for (int m = b; m < e; m++) {
+			float *crow = J->C + (int64_t)m * J->ldc;
+			for (int c = 0; c < J->nn; c++) {
+				int n0 = c * J->Nc;
+				int ncols = J->N - n0 < J->Nc ? J->N - n0 : J->Nc;
+				float *d = crow + n0;
+				const float *s0 = (const float *)J->cp + (size_t)c * J->c_tile + (size_t)m * J->Nc;
+				for (int n = 0; n < ncols; n++) d[n] = s0[n];
+				for (int jj = 1; jj < J->nk; jj++) {
+					const float *sj = (const float *)J->cp + (size_t)(jj * J->nn + c) * J->c_tile + (size_t)m * J->Nc;
+					for (int n = 0; n < ncols; n++) d[n] += sj[n];
+				}
+				if (mul != 1.f) for (int n = 0; n < ncols; n++) d[n] *= mul;
+			}
+		}
+		return;
+	}
 	for (int m = b; m < e; m++) {
 		float *crow = J->C + (int64_t)m * J->ldc;
 		const float rs = J->cv == CV_I8 ? J->a_row[m] : 1.f;
@@ -1061,8 +1101,9 @@ static inline float bitsf(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 static void amax_a_rows(void *v, int b, int e) {
 	job_t *J = v;
 	uint32_t *mx = (uint32_t *)J->amax_part;
+	const int lo = J->row_lo, hi = J->row_hi ? J->row_hi : J->M;
 	for (int it = b; it < e; it++) {
-		int m0 = it * 64, m1 = m0 + 64 < J->M ? m0 + 64 : J->M;
+		int m0 = lo + it * 64, m1 = m0 + 64 < hi ? m0 + 64 : hi;
 		if (J->sa_k == 1) {
 			for (int m = m0; m < m1; m++) {
 				const uint32_t *s = (const uint32_t *)(J->A + (int64_t)m * J->sa_m);
@@ -1205,13 +1246,97 @@ static inline int f16_range_ok(uint16_t hmax) { return hmax >= 0x1400 && hmax < 
 /* ------------------------------------------------------------------------------------
  * Engine: one tiled, chained, multi-core NPU matmul (or a batch of same-shape ones)
  * ---------------------------------------------------------------------------------- */
+/* run fn over items [off, off + n) */
+typedef struct { range_fn fn; void *arg; int off; } offwrap;
+static void off_range(void *v, int b, int e) { offwrap *W = v; W->fn(W->arg, b + W->off, e + W->off); }
+static void parallel_for_off(rk_ctx *ctx, int off, int n, int grain, range_fn fn, void *arg) {
+	offwrap W = { fn, arg, off };
+	parallel_for(ctx, n, grain, off_range, &W);
+}
+
+/* A submit (or a few, PC_TASK_LIMIT apart) run on a helper thread so the CPU can pack / unpack meanwhile */
+typedef struct { rk_ctx *ctx; int start, count, per_submit, cores, rc; pthread_t th; } sub_thread;
+static void *sub_thread_main(void *v) {
+	sub_thread *S = v;
+	S->rc = 0;
+	for (int s = S->start; s < S->start + S->count; s += S->per_submit) {
+		int cnt = S->start + S->count - s < S->per_submit ? S->start + S->count - s : S->per_submit;
+		if (submit(S->ctx, s, cnt, (S->cores == 3 && cnt >= 3) ? 3 : 1) < 0) { S->rc = -1; break; }
+	}
+	return NULL;
+}
+
+/* Tile layout for a K split into nk chunks: the same rules as gemm_engine's relayout (kept in sync). */
+typedef struct { int Kc, Nc, nn, Mt, nm, weights_fit; } layout_t;
+static int plan_layout(rk_ctx *ctx, const dtype_t *dt, int M, int N, int K, int nk, layout_t *L) {
+	const int ib = dt->in_bytes, G = dt->kgroup;
+	int Kp = round_up(K, 32);
+	int Kc = round_up(ceil_div(Kp, nk), 32);
+	int Np = round_up(N, G);
+	int nn = ceil_div(Np, ctx->max_n);
+	int Nc = round_up(ceil_div(Np, nn), G);
+	int Mp = round_up(M, 4);
+	for (;;) {
+		int wbanks_min = ceil_div(G * Kc * ib, CBUF_BANK_SIZE);
+		int wall = ceil_div(Kc * ib * Nc, CBUF_BANK_SIZE);
+		int wfloor = env_int("RKNPU_MIN_WBANKS", 4);
+		if (wall < wfloor) wfloor = wall;
+		if (wbanks_min < wfloor) wbanks_min = wfloor;
+		int dbanks_max = CBUF_BANKS - wbanks_min;
+		if (dbanks_max < 1) return -1;
+		int Mt = (int)((dbanks_max * (long)CBUF_BANK_SIZE) / (Kc * ib)) - 1;
+		Mt &= ~3;
+		if (Mt > ctx->max_m) Mt = ctx->max_m & ~3;
+		if (Mt > Mp) Mt = Mp;
+		if (Mt < 4) return -1;
+		int nm = ceil_div(Mp, Mt);
+		Mt = round_up(ceil_div(Mp, nm), 4);
+		int dbanks = ceil_div((Mt + 1) * Kc * ib, CBUF_BANK_SIZE);
+		int wbanks = CBUF_BANKS - dbanks;
+		int wf = (long)Kc * ib * Nc <= (long)wbanks * CBUF_BANK_SIZE;
+		if (!wf && Kc % 512) { Kc = round_up(Kc, 512); continue; }
+		L->Kc = Kc; L->Nc = Nc; L->nn = nn; L->Mt = Mt; L->nm = nm; L->weights_fit = wf;
+		return 0;
+	}
+}
+
+/* Pick the number of K chunks. More chunks mean taller M tiles (the data banks hold Mt rows of Kc), so the
+ * streamed weights are re-read fewer times, but the fp32 partial results of every chunk are written by the NPU
+ * and summed on the CPU. Model: NPU time = max(MACs / peak, DRAM bytes / bandwidth), plus the CPU reduction.
+ * Measured on the board: a 4096x4096x1024 GEMM goes from 61 ms to 31 ms of NPU time with 2 chunks (147 tasks
+ * each streaming 8 MB of weights -> 69), while 2048^3, compute-bound already, gains nothing. */
+static int plan_nk(rk_ctx *ctx, const dtype_t *dt, int M, int N, int K, int nb) {
+	int Kp = round_up(K, 32);
+	int nk0 = ceil_div(Kp, ctx->max_k);
+	/* only with 32-bit partials (fp32 / int32 out): fp16 partial sums would lose precision */
+	if (!ctx->kplan || nb > 1 || dt->out_bytes != 4) return nk0;
+	const double peak = ctx->plan_peak_gmacs * 1e9 * (ctx->mode == 2 ? 1.0 : 1.0 / 2.2);
+	const double bw = ctx->plan_npu_gbs * 1e9, cbw = ctx->plan_cpu_gbs * 1e9;
+	const int ib = dt->in_bytes, ob = dt->out_bytes;
+	double best = 1e30;
+	int best_nk = nk0;
+	for (int nk = nk0; nk <= nk0 * 16; nk *= 2) {
+		layout_t L;
+		if (round_up(ceil_div(Kp, nk), 32) < 256 && nk > nk0) break;
+		if (plan_layout(ctx, dt, M, N, K, nk, &L)) continue;
+		double tasks = (double)L.nm * nk * L.nn;
+		double wbytes = L.weights_fit ? (double)nk * L.nn * L.Nc * L.Kc * ib : tasks * L.Nc * L.Kc * ib;
+		double bytes = tasks * ((double)L.Mt * L.Kc * ib + (double)L.Mt * L.Nc * ob) + wbytes;
+		double macs = (double)M * N * K;
+		double t = (macs / peak > bytes / bw ? macs / peak : bytes / bw) + tasks * 5e-6
+		         + (nk > 1 ? (double)(nk - 1) * M * N * ob / cbw : 0.0);
+		if (t < best * 0.97) { best = t; best_nk = nk; }
+	}
+	return best_nk;
+}
+
 static int gemm_engine(rk_ctx *ctx, job_t *J) {
 	const dtype_t *dt = J->dt;
 	const int ib = dt->in_bytes, ob = dt->out_bytes, G = dt->kgroup;
 	const int M = J->M, N = J->N, K = J->K;
 
 	int Kp = round_up(K, 32);
-	int nk = ceil_div(Kp, ctx->max_k);
+	int nk = J->accumulate ? ceil_div(Kp, ctx->max_k) : plan_nk(ctx, dt, M, N, K, J->batch);
 	int Kc = round_up(ceil_div(Kp, nk), 32);
 	int Np = round_up(N, G);
 	int nn = ceil_div(Np, ctx->max_n);
@@ -1277,8 +1402,22 @@ relayout:
 	J->a_chunk = a_chunk; J->b_tile = b_tile; J->c_tile = c_tile;
 	J->nblk = ceil_div(Mp, 16);
 
+	/* Pipelining (one GEMM, no batch, no accumulation): split the M tiles into waves; pack wave w+1 while the
+	 * NPU runs wave w, and unpack wave w-1 meanwhile. Wave boundaries fall on 16-row pack blocks. */
+	int W = 1, wtiles = nm;
+	if (ctx->pipeline && nb == 1 && !J->accumulate && J->A && nm >= 2 &&
+	    (long)M * K + (long)M * N >= (long)ctx->pipeline_min) {
+		int step = 1;
+		while ((step * Mt) % 16) step++;
+		int want = nm < ctx->pipeline ? nm : ctx->pipeline;
+		wtiles = round_up(ceil_div(nm, want), step);
+		W = ceil_div(nm, wtiles);
+		if (W < 2) { W = 1; wtiles = nm; }
+	}
+	ctx->stats.waves = W;
+
 	double t0 = now_us();
-	if (J->A) {
+	if (J->A && W == 1) {
 		pfor_batched(ctx, J, nk * J->nblk, 4, pack_a_range);
 		if (J->opt_a && !f16_range_ok(hmax_par(ctx, J->ap, J->a_bat * nb))) {
 			/* outside the comfortable fp16 range at scale 1: scan the fp32 source, scale, pack again
@@ -1307,9 +1446,9 @@ relayout:
 		}
 		if (wc) wc->scale = J->b_scale;
 	}
-	if (J->opt_a || J->opt_b) J->out_mul = 1.f / (J->a_scale * J->b_scale);
+	if ((J->opt_a || J->opt_b) && W == 1) J->out_mul = 1.f / (J->a_scale * J->b_scale);
 	ctx->stats.pack_us += now_us() - t0;
-	buf_sync(ctx, &ctx->a, a_bytes, RKNPU_MEM_SYNC_TO_DEVICE);
+	if (W == 1) buf_sync(ctx, &ctx->a, a_bytes, RKNPU_MEM_SYNC_TO_DEVICE);
 	if (pack_b) {
 		buf_sync(ctx, wc ? &wc->buf : &ctx->b, b_bytes, RKNPU_MEM_SYNC_TO_DEVICE);
 		if (wc) {
@@ -1325,11 +1464,28 @@ relayout:
 	struct rknpu_task *tk = ctx->tasks.ptr;
 	int cores = ctx->mode == 2 ? 3 : 1;
 	int per_submit = ctx->mode == 0 ? 1 : PC_TASK_LIMIT;
+	/* wave w covers tiles [w*wtiles, min(nm, (w+1)*wtiles)); its tasks are contiguous, ordered (j, c, i) */
+	int wstart[65];
+	wstart[0] = 0;
+	for (int w = 0; w < W; w++) {
+		int i0 = w * wtiles, i1 = i0 + wtiles < nm ? i0 + wtiles : nm;
+		wstart[w + 1] = wstart[w] + (i1 - i0) * nk * nn * (W == 1 ? nb : 1);
+	}
 	for (int t = 0; t < TT; t++) {
-		int bb = t / T, tl = t % T;
-		int i = tl % nm, jc = tl / nm, j = jc / nn;
-		int sub_start = (t / per_submit) * per_submit;
-		int sub_count = TT - sub_start < per_submit ? TT - sub_start : per_submit;
+		int bb, i, jc;
+		int w = 0;
+		while (t >= wstart[w + 1]) w++;
+		if (W == 1) {
+			bb = t / T;
+			int tl = t % T;
+			i = tl % nm; jc = tl / nm;
+		} else {
+			int i0 = w * wtiles, ni = (nm - i0 < wtiles ? nm - i0 : wtiles), tl = t - wstart[w];
+			bb = 0; i = i0 + tl % ni; jc = tl / ni;
+		}
+		int j = jc / nn;
+		int sub_start = wstart[w] + ((t - wstart[w]) / per_submit) * per_submit;
+		int sub_count = wstart[w + 1] - sub_start < per_submit ? wstart[w + 1] - sub_start : per_submit;
 		int first = 0, last = 0;
 		if (ctx->mode == 0) first = last = 1;
 		else if (cores == 1 || sub_count < 3) { first = t == sub_start; last = t == sub_start + sub_count - 1; }
@@ -1344,7 +1500,7 @@ relayout:
 		}
 		task_desc d = {
 			.dt = dt, .m = Mt, .k = Kc, .n = Nc, .grains = Mt + 1, .dbanks = dbanks, .wbanks = wbanks,
-			.reuse = ctx->reuse && weights_fit && !first && i > 0,
+			.reuse = ctx->reuse && weights_fit && !first && i > (W == 1 ? 0 : (i / wtiles) * wtiles),
 			.in_dma = (uint32_t)(ctx->a.dma + ((size_t)bb * J->a_bat + (size_t)j * a_chunk + (size_t)i * Mt * Kc) * ib),
 			.w_dma = (uint32_t)(b_dma + ((size_t)bb * J->b_bat + (size_t)jc * b_tile) * ib),
 			.out_dma = (uint32_t)(ctx->c.dma + ((size_t)bb * J->c_bat + (size_t)jc * c_tile + (size_t)i * Mt * Nc) * ob),
@@ -1362,20 +1518,91 @@ relayout:
 	buf_sync(ctx, &ctx->regcmd, (size_t)TT * REGCMD_SLOTS * 8, RKNPU_MEM_SYNC_TO_DEVICE);
 	buf_sync(ctx, &ctx->tasks, (size_t)TT * sizeof(struct rknpu_task), RKNPU_MEM_SYNC_TO_DEVICE);
 
-	npu_lock(ctx);
-	for (int s = 0; s < TT; s += per_submit) {
-		int cnt = TT - s < per_submit ? TT - s : per_submit;
-		if (submit(ctx, s, cnt, (cores == 3 && cnt >= 3) ? 3 : 1) < 0) { npu_unlock(ctx); return -1; }
-	}
-	npu_unlock(ctx);
+	if (W == 1) {
+		npu_lock(ctx);
+		for (int s = 0; s < TT; s += per_submit) {
+			int cnt = TT - s < per_submit ? TT - s : per_submit;
+			if (submit(ctx, s, cnt, (cores == 3 && cnt >= 3) ? 3 : 1) < 0) { npu_unlock(ctx); return -1; }
+		}
+		npu_unlock(ctx);
 
-	buf_sync(ctx, &ctx->c, c_bytes, RKNPU_MEM_SYNC_FROM_DEVICE);
-	if (J->C) {
-		t0 = now_us();
-		pfor_batched(ctx, J, M, 64, unpack_range);
-		ctx->stats.unpack_us += now_us() - t0;
+		buf_sync(ctx, &ctx->c, c_bytes, RKNPU_MEM_SYNC_FROM_DEVICE);
+		if (J->C) {
+			t0 = now_us();
+			pfor_batched(ctx, J, M, 64, unpack_range);
+			ctx->stats.unpack_us += now_us() - t0;
+		}
+		return 0;
 	}
-	return 0;
+
+	/* ---- pipelined waves ---- */
+	float wmul[64];
+	sub_thread S = { .ctx = ctx, .per_submit = per_submit, .cores = cores };
+	int running = 0, prc = 0;
+	double tp = 0, tu = 0;
+	npu_lock(ctx);
+	for (int w = 0; w <= W && !prc; w++) {
+		if (w < W) {
+			/* pack wave w */
+			int r0 = w * wtiles * Mt, r1 = (w + 1) * wtiles * Mt < Mp ? (w + 1) * wtiles * Mt : Mp;
+			int b0 = r0 / 16, nbk = ceil_div(r1, 16) - b0;
+			t0 = now_us();
+			float sc_save = J->a_scale;
+			for (int j = 0; j < nk; j++) parallel_for_off(ctx, j * J->nblk + b0, nbk, 4, pack_a_range, J);
+			if (J->opt_a) {
+				uint16_t hm = 0;
+				for (int j = 0; j < nk; j++) {
+					uint16_t h = hmax_par(ctx, (const uint16_t *)J->ap + (size_t)j * a_chunk + (size_t)r0 * Kc,
+					                      (size_t)(r1 - r0) * Kc);
+					hm = h > hm ? h : hm;
+				}
+				if (!f16_range_ok(hm)) {
+					int rr1 = r1 < M ? r1 : M;
+					float amax = 0.f;
+					if (rr1 > r0) {
+						J->row_lo = r0; J->row_hi = rr1;
+						J->amax_part = scratch(ctx, 0, (size_t)M);
+						parallel_for(ctx, ceil_div(rr1 - r0, 64), 1, amax_a_rows, J);
+						for (int m = r0; m < rr1; m++) if (J->amax_part[m] > amax) amax = J->amax_part[m];
+						J->row_lo = J->row_hi = 0; J->amax_part = NULL;
+					}
+					if (amax != 0.f) {
+						J->a_scale = pow2_scale(amax);
+						for (int j = 0; j < nk; j++) parallel_for_off(ctx, j * J->nblk + b0, nbk, 4, pack_a_range, J);
+					}
+				}
+			}
+			wmul[w] = J->opt_a || J->opt_b ? 1.f / (J->a_scale * J->b_scale) : J->out_mul;
+			J->a_scale = sc_save;
+			for (int j = 0; j < nk; j++)
+				buf_sync_range(ctx, &ctx->a, ((size_t)j * a_chunk + (size_t)r0 * Kc) * ib, (size_t)(r1 - r0) * Kc * ib,
+				               RKNPU_MEM_SYNC_TO_DEVICE);
+			tp += now_us() - t0;
+		}
+		if (running) { pthread_join(S.th, NULL); running = 0; if (S.rc) { prc = -1; break; } }
+		if (w < W) {
+			S.start = wstart[w]; S.count = wstart[w + 1] - wstart[w];
+			if (pthread_create(&S.th, NULL, sub_thread_main, &S)) { sub_thread_main(&S); if (S.rc) { prc = -1; break; } }
+			else running = 1;
+		}
+		if (w > 0 && J->C) {
+			/* unpack wave w-1 while the NPU runs wave w */
+			int u = w - 1, r0 = u * wtiles * Mt, r1 = (u + 1) * wtiles * Mt;
+			if (r1 > M) r1 = M;
+			t0 = now_us();
+			for (int jc = 0; jc < nk * nn; jc++)
+				buf_sync_range(ctx, &ctx->c, ((size_t)jc * c_tile + (size_t)r0 * Nc) * ob, (size_t)(r1 - r0) * Nc * ob,
+				               RKNPU_MEM_SYNC_FROM_DEVICE);
+			J->out_mul = wmul[u];
+			if (r1 > r0) parallel_for_off(ctx, r0, r1 - r0, 64, unpack_range, J);
+			tu += now_us() - t0;
+		}
+	}
+	if (running) { pthread_join(S.th, NULL); if (S.rc) prc = -1; }
+	npu_unlock(ctx);
+	ctx->stats.pack_us += tp;
+	ctx->stats.unpack_us += tu;
+	return prc;
 }
 
 /* ------------------------------------------------------------------------------------

@@ -40,7 +40,7 @@ def run(M, N, K, A, sa_m, sa_k, B, sb_k, sb_n):
 
 
 print(f"{'shape (MxKxN)':<16}{'gemm':<5}{'ms':>8}{'GFLOPS':>8}{'pack':>8}{'sync':>7}{'submit':>8}{'hw':>7}{'unpack':>8}"
-      f"{'tasks':>6}")
+      f"{'tasks':>6}{'waves':>6}")
 for s in args.shapes.split(","):
     M, K, N = map(int, s.split("x"))
     x, w, g = torch.randn(M, K), torch.randn(N, K), torch.randn(M, N)
@@ -51,4 +51,4 @@ for s in args.shapes.split(","):
         t, st = run(m, n, k, A, sam, sak, B, sbk, sbn)
         print(f"{s:<16}{name:<5}{t * 1e3:>8.2f}{2 * m * n * k / t / 1e9:>8.0f}{st['pack_us'] / 1e3:>8.2f}"
               f"{st['sync_us'] / 1e3:>7.2f}{st['submit_us'] / 1e3:>8.2f}{st['hw_us'] / 1e3:>7.2f}"
-              f"{st['unpack_us'] / 1e3:>8.2f}{st['tasks']:>6}", flush=True)
+              f"{st['unpack_us'] / 1e3:>8.2f}{st['tasks']:>6}{st['waves']:>6}", flush=True)

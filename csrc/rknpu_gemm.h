@@ -28,6 +28,7 @@ typedef struct {
 	int    m_tile, k_tile, n_tile;
 	double sync_us;     /* CPU cache maintenance (MEM_SYNC ioctls) */
 	int    cache_hits;  /* weight operands taken from the packed-weight cache */
+	int    waves;       /* pipeline waves of the last GEMM (1 = not pipelined; pack/unpack then overlap submit) */
 } rk_stats;
 
 /* Opens the NPU DRM node (NULL = auto-detect the "rknpu" card). Returns NULL on failure. */

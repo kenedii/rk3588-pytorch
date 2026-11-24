@@ -52,6 +52,7 @@ class RkStats(ctypes.Structure):
         ("n_tile", ctypes.c_int),
         ("sync_us", ctypes.c_double),
         ("cache_hits", ctypes.c_int),
+        ("waves", ctypes.c_int),
     ]
 
     def as_dict(self):
