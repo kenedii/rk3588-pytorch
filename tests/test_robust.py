@@ -31,6 +31,7 @@ def check(name, ok, detail=""):
 
 
 ops.MIN_MACS = 0
+ops.ATTENTION = "npu"   # exercise the NPU attention path (the default "auto" leaves small heads to the CPU)
 assert rt.npu_available(), rt.npu_error()
 
 # ---- batched GEMM: one submission for all batch elements ----
