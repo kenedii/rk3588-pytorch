@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch.overrides import TorchFunctionMode
 
-from . import eltwise, ops
+from . import eltwise, ops, rnn
 
 _MM_FUNCS = {torch.mm, torch.Tensor.mm, torch.matmul, torch.Tensor.matmul, torch.Tensor.__matmul__}
 _BMM_FUNCS = {torch.bmm, torch.Tensor.bmm}
@@ -418,13 +418,13 @@ class _FusedReLU(torch.nn.Module):
 
 
 _SWAP = {torch.nn.Linear: NPULinear, torch.nn.Conv2d: NPUConv2d, torch.nn.Conv1d: NPUConv1d,
-         torch.nn.ConvTranspose2d: NPUConvTranspose2d}
+         torch.nn.ConvTranspose2d: NPUConvTranspose2d, torch.nn.LSTM: rnn.NPULSTM, torch.nn.GRU: rnn.NPUGRU}
 _FUSABLE = (NPULinear, NPUConv2d, NPUConv1d)
 
 
 def convert(model, fuse_relu=True):
-    """Swap every nn.Linear / nn.Conv1d / nn.Conv2d / nn.ConvTranspose2d in `model` for its NPU
-    version, in place (weights are shared, state_dict keys unchanged). With fuse_relu, a
+    """Swap every nn.Linear / nn.Conv1d / nn.Conv2d / nn.ConvTranspose2d / nn.LSTM / nn.GRU in `model` for its
+    NPU version (and Hugging Face-style RMSNorm modules for the fused kernel), in place (weights are shared, state_dict keys unchanged). With fuse_relu, a
     Linear/Conv followed by nn.ReLU inside an nn.Sequential runs the ReLU in the NPU output
     stage (the ReLU module becomes a pass-through). Returns model."""
     if type(model) in _SWAP:
