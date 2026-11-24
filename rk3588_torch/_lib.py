@@ -109,6 +109,8 @@ def _load():
     lib.rk_get_stats.argtypes = [vp, ctypes.POINTER(RkStats)]
     lib.rk_eltwise.argtypes = [vp, i, i, vp, vp, vp, vp, vp, vp, ctypes.c_long, ctypes.c_long, ctypes.c_float]
     lib.rk_eltwise.restype = i
+    lib.rk_dwconv.argtypes = [vp, i, vp, vp, vp, vp] + [i] * 12
+    lib.rk_dwconv.restype = i
     lib.rk_gemm_batched.argtypes = [vp, i, i, i, i, i, fp, i64, i64, i64, fp, i64, i64, i64, fp, i64, i64, i]
     lib.rk_gemm_batched.restype = i
     lib.rk_release.argtypes = [vp]
@@ -160,6 +162,12 @@ class NPU:
         with self.lock:
             return self.lib.rk_eltwise(self.ctx, int(op), int(bf16), x or None, g or None, w or None, y or None,
                                        aux or None, dw or None, int(rows), int(D), float(eps))
+
+    def dwconv(self, op, x, w, dy, out, N, C, H, W, KH, KW, sy, sx, pt, pl, OH, OW):
+        """Depthwise conv kernel (see rk_dwconv); pointer arguments are ints (0 = NULL)."""
+        with self.lock:
+            return self.lib.rk_dwconv(self.ctx, int(op), x or None, w or None, dy or None, out,
+                                      *(int(v) for v in (N, C, H, W, KH, KW, sy, sx, pt, pl, OH, OW)))
 
     def set_mode(self, mode):
         self.lib.rk_set_mode(self.ctx, int(mode))

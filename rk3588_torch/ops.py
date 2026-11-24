@@ -676,7 +676,7 @@ def _pair(v):
 def _groups_ok(C, O, groups):
     """Grouped convolutions run as one NPU task chain with every group padded to 32 input /
     16 output channels; worth it only if that padding wastes less than ~8x. Depthwise
-    (1 channel per group) stays on the CPU: the NPU's depthwise mode isn't reverse-engineered."""
+    (1 channel per group) stays on the CPU (dwconv.py's NEON kernels): the NPU's fp16 depthwise mode doesn't work."""
     if groups == 1:
         return True
     if C % groups or O % groups:
@@ -956,6 +956,9 @@ def conv2d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, act=
     if pads is None or min(pads) < 0:
         return None
     t, b, l, r = pads
+    if groups > 1 and groups == x.shape[1] == weight.shape[0] and weight.shape[1] == 1 and dl == (1, 1):
+        from . import dwconv               # depthwise: the library's CPU kernels (the NPU mode isn't usable)
+        return dwconv.conv2d(x, weight, bias, st, pads, act)
     sym = t == b and l == r and t <= 15 and l <= 15
     N, C, H, W = x.shape
     OH = (H + t + b - dl[0] * (kh - 1) - 1) // st[0] + 1

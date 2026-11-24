@@ -9,7 +9,7 @@ torch.einsum, F.scaled_dot_product_attention, F.multi_head_attention_forward (nn
 nn.Transformer*), F.conv1d / F.conv2d and F.conv_transpose2d
 on CPU float tensors run on the NPU (forward and backward); every other op stays on the
 CPU. Convolutions use the NPU's native convolution engine (dilated ones via space-to-batch; grouped convolutions
-when the groups aren't too thin; depthwise ones stay on the CPU). Biases are added in the
+when the groups aren't too thin; depthwise ones run in the library's NEON CPU kernels). Biases are added in the
 NPU library's output stage. If no NPU is available everything simply runs on the CPU.
 """
 import inspect

@@ -94,6 +94,11 @@ int rk_query(rk_ctx *ctx, rk_info *info);
 int rk_eltwise(rk_ctx *ctx, int op, int bf16, const void *x, const void *g, const void *w, void *y, float *aux,
                float *dw, long rows, long D, float eps);
 
+/* Depthwise conv on the CPU (NCHW fp32, one KHxKW filter per channel, stride sy/sx, top/left padding pt/pl,
+ * output OHxOW): op 0 out = y from x, w; op 1 out = dx from dy, w; op 2 out = dw (C,KH,KW) from x, dy. */
+int rk_dwconv(rk_ctx *ctx, int op, const float *x, const float *w, const float *dy, float *out,
+              int N, int C, int H, int W, int KH, int KW, int sy, int sx, int pt, int pl, int OH, int OW);
+
 /* Hardware probing: one task, raw bytes, caller-chosen precision codes (M%4==0, K%32==0, N%16==0;
  * a_rows is M x K row-major, w_bytes is N*K elements in the NPU weight layout). */
 typedef struct {
