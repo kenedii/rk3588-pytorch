@@ -51,6 +51,7 @@ ops._npu_gemm = _recording
 torch.manual_seed(0)
 ops.VERIFY = "off"
 ops.MIN_MACS = 0
+ops.ATTENTION = "npu"   # exercise the NPU attention path (the default "auto" leaves small heads to the CPU)
 failures = 0
 
 

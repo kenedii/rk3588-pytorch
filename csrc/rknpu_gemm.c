@@ -81,6 +81,7 @@ struct rk_ctx {
 	int      max_n;
 	int      timeout_ms;
 	int      reuse;
+	int      pingpong;         /* RKNPU_JOB_PINGPONG on submits (RKNPU_PINGPONG, default 1) */
 	struct pool *pool;
 	int      autoscale;
 	int      lock_fd;          /* cross-process lock (flock) or -1 */
@@ -155,7 +156,8 @@ rk_ctx *rk_open(const char *dev) {
 	ctx->max_n = env_int("RKNPU_MAX_N", 4096);
 	ctx->timeout_ms = env_int("RKNPU_TIMEOUT_MS", 3000);
 	ctx->reuse = env_int("RKNPU_WEIGHT_REUSE", 1);
-	ctx->autoscale = env_int("RKNPU_AUTOSCALE", 1);
+	ctx->pingpong = env_int("RKNPU_PINGPONG", 1);
+	ctx->autoscale = env_int("RKNPU_AUTOSCALE", 2);   /* 0 off, 1 always scan, 2 optimistic (see gemm_front) */
 	ctx->max_buf = (size_t)env_int("RKNPU_MAX_BUF_MB", 512) << 20;
 	ctx->wc_max = (size_t)env_int("RKNPU_WCACHE_MB", 256) << 20;
 	ctx->lock_fd = -1;
@@ -521,7 +523,7 @@ static void emit_task(uint64_t *o, const task_desc *t) {
 static int submit(rk_ctx *ctx, int start, int count, int cores) {
 	struct rknpu_submit s;
 	memset(&s, 0, sizeof(s));
-	s.flags = RKNPU_JOB_PC | RKNPU_JOB_PINGPONG;
+	s.flags = RKNPU_JOB_PC | (ctx->pingpong ? RKNPU_JOB_PINGPONG : 0);
 	s.timeout = ctx->timeout_ms;
 	s.task_obj_addr = ctx->tasks.obj;
 	s.fence_fd = -1;
@@ -705,6 +707,62 @@ static inline int8_t f32_to_i8(float x) {
 	return (int8_t)(int)(x + __builtin_copysignf(0.5f, x));   /* truncation after +-0.5 = round */
 }
 
+/* ------------------------------------------------------------------------------------
+ * NEON building blocks for the transposing packers: convert 8 floats to fp16 / bf16 bits,
+ * and transpose an 8x8 block of 16-bit values. A transposed operand (dW = dY^T X, row-major B
+ * in dX = dY W, NCHW feature maps for convolutions) used to be packed one scalar element at a
+ * time with a strided store; this does 64 elements per 8x8 block in registers.
+ * ---------------------------------------------------------------------------------- */
+#if defined(__aarch64__) && !defined(RKNPU_NO_NEON)
+#include <arm_neon.h>
+#define HAVE_NEON8 1
+static inline uint16x8_t cvt8_f16(const float *p, float sc) {
+	float32x4_t a = vmulq_n_f32(vld1q_f32(p), sc), b = vmulq_n_f32(vld1q_f32(p + 4), sc);
+	return vreinterpretq_u16_f16(vcombine_f16(vcvt_f16_f32(a), vcvt_f16_f32(b)));
+}
+static inline uint16x4_t bf16x4(float32x4_t x) {
+	uint32x4_t u = vreinterpretq_u32_f32(x);
+	uint32x4_t r = vaddq_u32(u, vaddq_u32(vdupq_n_u32(0x7fff), vandq_u32(vshrq_n_u32(u, 16), vdupq_n_u32(1))));
+	uint32x4_t nan = vcgtq_u32(vandq_u32(u, vdupq_n_u32(0x7fffffff)), vdupq_n_u32(0x7f800000));
+	uint32x4_t q = vorrq_u32(u, vdupq_n_u32(0x400000));          /* quiet NaN, like f32_to_bf16 */
+	return vshrn_n_u32(vbslq_u32(nan, q, r), 16);
+}
+static inline uint16x8_t cvt8_bf16(const float *p, float sc) {
+	return vcombine_u16(bf16x4(vmulq_n_f32(vld1q_f32(p), sc)), bf16x4(vmulq_n_f32(vld1q_f32(p + 4), sc)));
+}
+/* r[i] holds row i (8 lanes); afterwards r[j] holds column j */
+static inline void tr8x8_u16(uint16x8_t r[8]) {
+	uint16x8_t a0 = vtrn1q_u16(r[0], r[1]), a1 = vtrn2q_u16(r[0], r[1]);
+	uint16x8_t a2 = vtrn1q_u16(r[2], r[3]), a3 = vtrn2q_u16(r[2], r[3]);
+	uint16x8_t a4 = vtrn1q_u16(r[4], r[5]), a5 = vtrn2q_u16(r[4], r[5]);
+	uint16x8_t a6 = vtrn1q_u16(r[6], r[7]), a7 = vtrn2q_u16(r[6], r[7]);
+	uint32x4_t b0 = vtrn1q_u32(vreinterpretq_u32_u16(a0), vreinterpretq_u32_u16(a2));
+	uint32x4_t b2 = vtrn2q_u32(vreinterpretq_u32_u16(a0), vreinterpretq_u32_u16(a2));
+	uint32x4_t b1 = vtrn1q_u32(vreinterpretq_u32_u16(a1), vreinterpretq_u32_u16(a3));
+	uint32x4_t b3 = vtrn2q_u32(vreinterpretq_u32_u16(a1), vreinterpretq_u32_u16(a3));
+	uint32x4_t b4 = vtrn1q_u32(vreinterpretq_u32_u16(a4), vreinterpretq_u32_u16(a6));
+	uint32x4_t b6 = vtrn2q_u32(vreinterpretq_u32_u16(a4), vreinterpretq_u32_u16(a6));
+	uint32x4_t b5 = vtrn1q_u32(vreinterpretq_u32_u16(a5), vreinterpretq_u32_u16(a7));
+	uint32x4_t b7 = vtrn2q_u32(vreinterpretq_u32_u16(a5), vreinterpretq_u32_u16(a7));
+#define T64(x, y, lo) vreinterpretq_u16_u64((lo) ? vtrn1q_u64(vreinterpretq_u64_u32(x), vreinterpretq_u64_u32(y)) \
+                                                : vtrn2q_u64(vreinterpretq_u64_u32(x), vreinterpretq_u64_u32(y)))
+	r[0] = T64(b0, b4, 1); r[4] = T64(b0, b4, 0);
+	r[1] = T64(b1, b5, 1); r[5] = T64(b1, b5, 0);
+	r[2] = T64(b2, b6, 1); r[6] = T64(b2, b6, 0);
+	r[3] = T64(b3, b7, 1); r[7] = T64(b3, b7, 0);
+#undef T64
+}
+/* rows src[i*sstride .. +8) (i < 8), converted and transposed: dst[j*dstride + i] = cvt(src[i*sstride + j]) */
+static inline void tr8x8_cvt(const float *src, int64_t sstride, uint16_t *dst, size_t dstride, float sc, int bf) {
+	uint16x8_t r[8];
+	for (int i = 0; i < 8; i++) r[i] = bf ? cvt8_bf16(src + i * sstride, sc) : cvt8_f16(src + i * sstride, sc);
+	tr8x8_u16(r);
+	for (int j = 0; j < 8; j++) vst1q_u16(dst + j * dstride, r[j]);
+}
+#else
+#define HAVE_NEON8 0
+#endif
+
 typedef struct {
 	const dtype_t *dt;
 	int cv;                               /* CV_* input conversion */
@@ -729,6 +787,7 @@ typedef struct {
 	int relu;                             /* epilogue: max(., 0) */
 	int relu_dpu;                         /* the ReLU already ran in the DPU */
 	struct wc_entry *wc;                  /* cached packed B (or NULL) */
+	int opt_a, opt_b;                     /* fp16 optimistic scaling: packed at scale 1, range checked after */
 } job_t;
 
 /* write one converted element of A row m / B column n */
@@ -751,6 +810,23 @@ static void pack_a_range(void *v, int b, int e) {
 		int k0 = j * Kc;
 		size_t base = (size_t)j * J->a_chunk;
 		int kend = K - k0 < Kc ? K - k0 : Kc;
+		if (HAVE_NEON8 && J->sa_m == 1 && J->sa_k != 1 && (cv == CV_F16 || cv == CV_BF16) && r1 - r0 == 16 && r1 <= M) {
+#if HAVE_NEON8
+			/* transposed source, 8x8 blocks: 8 k-rows of 8 consecutive m -> 8 m-rows of 8 consecutive k */
+			const float sc = cv == CV_F16 ? J->a_scale : 1.f;
+			uint16_t *ap = (uint16_t *)J->ap;
+			int k8 = kend & ~7;
+			for (int k = 0; k < k8; k += 8)
+				for (int m = r0; m < r1; m += 8)
+					tr8x8_cvt(J->A + (int64_t)(k0 + k) * J->sa_k + m, J->sa_k, ap + base + (size_t)m * Kc + k, Kc, sc,
+					          cv == CV_BF16);
+			for (int m = r0; m < r1; m++) {
+				for (int k = k8; k < kend; k++) store_el(cv, J->ap, base + (size_t)m * Kc + k, CONV_A(J, J->A[m + (int64_t)(k0 + k) * J->sa_k], m));
+				for (int k = kend; k < Kc; k++) ap[base + (size_t)m * Kc + k] = 0;
+			}
+#endif
+			continue;
+		}
 		if (J->sa_m == 1 && J->sa_k != 1) {
 			/* transposed source: walk k-major so reads are contiguous along m */
 			for (int k = 0; k < Kc; k++) {
@@ -823,7 +899,23 @@ static void NAME(void *v, int b, int e) {                                       
 		int j = jc / J->nn, c = jc % J->nn;                                                      \
 		T *dst = (T *)J->bp + (size_t)jc * J->b_tile + (size_t)ng * G * Kc;                      \
 		int nb = c * Nc + ng * G;                                                                \
-		if (J->sb_n == 1 && J->sb_k != 1) {                                                      \
+		if (J->sb_n == 1 && J->sb_k != 1 && FAST && nb + G <= N) {                               \
+			/* row-major B: 8 k-rows x 8 n -> 8 n-rows x 8 k (32-element k blocks) */               \
+			for (int cb = 0; cb < Kc / 32; cb++)                                                 \
+				for (int kr = 0; kr < 32; kr += 8) {                                             \
+					int gk = j * Kc + cb * 32 + kr;                                              \
+					for (int nr = 0; nr < G; nr += 8) {                                          \
+						T *d = dst + cb * 32 * G + nr * 32 + kr;                                 \
+						if (gk + 8 <= K) {                                                       \
+							FASTCALL(J->B + (int64_t)gk * J->sb_k + nb + nr, J->sb_k, (uint16_t *)d, 32); \
+						} else {                                                                 \
+							for (int i = 0; i < 8; i++)                                          \
+								for (int t = 0; t < 8; t++)                                      \
+									d[t * 32 + i] = CONV(gk + i < K ? J->B[(int64_t)(gk + i) * J->sb_k + nb + nr + t] : 0.f, nb + nr + t); \
+						}                                                                        \
+					}                                                                            \
+				}                                                                                \
+		} else if (J->sb_n == 1 && J->sb_k != 1) {                                               \
 			for (int cb = 0; cb < Kc / 32; cb++)                                                 \
 				for (int kr = 0; kr < 32; kr++) {                                                \
 					int gk = j * Kc + cb * 32 + kr;                                              \
@@ -859,9 +951,28 @@ static void NAME(void *v, int b, int e) {                                       
 #define CONV_F16(x, n)  ((f16)((x) * J->b_scale))
 #define CONV_BF16(x, n) (f32_to_bf16((x) * J->b_scale))
 #define CONV_I8(x, n)   (f32_to_i8((x) * J->b_col[n]))
+#if HAVE_NEON8
+#define FAST 1
+#define FASTCALL(src, ss, d, ds) tr8x8_cvt((src), (ss), (d), (ds), J->b_scale, 0)
+DEFINE_PACK_B(pack_b_f16_range, f16, 16, CONV_F16)
+#undef FASTCALL
+#define FASTCALL(src, ss, d, ds) tr8x8_cvt((src), (ss), (d), (ds), J->b_scale, 1)
+DEFINE_PACK_B(pack_b_bf16_range, uint16_t, 16, CONV_BF16)
+#undef FASTCALL
+#undef FAST
+#else
+#define FAST 0
+#define FASTCALL(src, ss, d, ds) (void)0
 DEFINE_PACK_B(pack_b_f16_range, f16, 16, CONV_F16)
 DEFINE_PACK_B(pack_b_bf16_range, uint16_t, 16, CONV_BF16)
+#undef FASTCALL
+#undef FAST
+#endif
+#define FAST 0
+#define FASTCALL(src, ss, d, ds) (void)0
 DEFINE_PACK_B(pack_b_i8_range, int8_t, 32, CONV_I8)
+#undef FASTCALL
+#undef FAST
 
 /* output epilogue on one finished row of C */
 static inline void epi_row(float *crow, int N, const float *bias, int relu) {
@@ -1053,6 +1164,44 @@ static void pfor_batched(rk_ctx *ctx, job_t *J, int per, int grain, range_fn fn)
 	parallel_for(ctx, per * J->batch, grain, batched_range, &W);
 }
 
+static float *scratch(rk_ctx *ctx, int which, size_t n);
+static float amax_all(rk_ctx *ctx, job_t *J, int rows, range_fn fn);
+static void amax_a_rows(void *v, int b, int e);
+static void amax_b_cols(void *v, int b, int e);
+static float pow2_scale(float amax);
+
+/* max |h| (as fp16 bits, sign cleared) over packed fp16 data; items are 64K-element blocks */
+typedef struct { const uint16_t *p; size_t n; uint16_t *part; } hmax_job;
+static void hmax_range(void *v, int b, int e) {
+	hmax_job *H = v;
+	for (int it = b; it < e; it++) {
+		size_t i0 = (size_t)it * 65536, i1 = i0 + 65536 < H->n ? i0 + 65536 : H->n, i = i0;
+		uint16_t m = 0;
+#if HAVE_NEON8
+		uint16x8_t mv = vdupq_n_u16(0);
+		const uint16x8_t mask = vdupq_n_u16(0x7fff);
+		for (; i + 8 <= i1; i += 8) mv = vmaxq_u16(mv, vandq_u16(vld1q_u16(H->p + i), mask));
+		m = vmaxvq_u16(mv);
+#endif
+		for (; i < i1; i++) { uint16_t x = H->p[i] & 0x7fff; m = x > m ? x : m; }
+		H->part[it] = m;
+	}
+}
+static uint16_t hmax_par(rk_ctx *ctx, const void *p, size_t n) {
+	int items = (int)((n + 65535) / 65536);
+	uint16_t *part = (uint16_t *)scratch(ctx, 0, (size_t)items);
+	if (!part) return 0x7c00;
+	hmax_job H = { p, n, part };
+	parallel_for(ctx, items, 1, hmax_range, &H);
+	uint16_t m = 0;
+	for (int i = 0; i < items; i++) m = part[i] > m ? part[i] : m;
+	return m;
+}
+/* Packed at scale 1, is the operand comfortably inside fp16 (no overflow, largest value >= 2^-10 so the
+ * rounding error of the large values dwarfs what subnormals lose)? 0x1400 = 2^-10, 0x7c00 = inf.
+ * A maximum of 0 is not "ok": everything may have underflowed (an all-zero operand costs one scan). */
+static inline int f16_range_ok(uint16_t hmax) { return hmax >= 0x1400 && hmax < 0x7c00; }
+
 /* ------------------------------------------------------------------------------------
  * Engine: one tiled, chained, multi-core NPU matmul (or a batch of same-shape ones)
  * ---------------------------------------------------------------------------------- */
@@ -1129,14 +1278,36 @@ relayout:
 	J->nblk = ceil_div(Mp, 16);
 
 	double t0 = now_us();
-	if (J->A) pfor_batched(ctx, J, nk * J->nblk, 4, pack_a_range);
+	if (J->A) {
+		pfor_batched(ctx, J, nk * J->nblk, 4, pack_a_range);
+		if (J->opt_a && !f16_range_ok(hmax_par(ctx, J->ap, J->a_bat * nb))) {
+			/* outside the comfortable fp16 range at scale 1: scan the fp32 source, scale, pack again
+			 * (unless it really is all zeros) */
+			float amax = amax_all(ctx, J, M, amax_a_rows);
+			J->amax_part = NULL;
+			if (amax != 0.f) {
+				J->a_scale = pow2_scale(amax);
+				pfor_batched(ctx, J, nk * J->nblk, 4, pack_a_range);
+			}
+		}
+	}
 	if (pack_b) {
 		range_fn pb = pack_b_range;
 		if (J->cv == CV_F16 && G == 16) pb = pack_b_f16_range;
 		else if (J->cv == CV_BF16 && G == 16) pb = pack_b_bf16_range;
 		else if (J->cv == CV_I8 && G == 32) pb = pack_b_i8_range;
 		pfor_batched(ctx, J, nk * nn * (Nc / G), 1, pb);
+		if (J->opt_b && !f16_range_ok(hmax_par(ctx, J->bp, J->b_bat * nb))) {
+			float amax = amax_all(ctx, J, N, amax_b_cols);
+			J->amax_part = NULL;
+			if (amax != 0.f) {
+				J->b_scale = pow2_scale(amax);
+				pfor_batched(ctx, J, nk * nn * (Nc / G), 1, pb);
+			}
+		}
+		if (wc) wc->scale = J->b_scale;
 	}
+	if (J->opt_a || J->opt_b) J->out_mul = 1.f / (J->a_scale * J->b_scale);
 	ctx->stats.pack_us += now_us() - t0;
 	buf_sync(ctx, &ctx->a, a_bytes, RKNPU_MEM_SYNC_TO_DEVICE);
 	if (pack_b) {
@@ -1283,7 +1454,7 @@ static int gemm_front(rk_ctx *ctx, int prec, int batch, int M, int N, int K,
 	case RK_PREC_FP16_OUT16:
 		J.dt = prec == RK_PREC_BF16 ? &DT_BF16_F32 : prec == RK_PREC_FP16 ? &DT_F16_F32 : &DT_F16_F16;
 		J.cv = prec == RK_PREC_BF16 ? CV_BF16 : CV_F16;
-		if (prec == RK_PREC_FP16 && ctx->autoscale) {
+		if (prec == RK_PREC_FP16 && ctx->autoscale == 1) {
 			/* exact power-of-two scaling keeps both operands inside fp16 range */
 			t0 = now_us();
 			J.a_scale = pow2_scale(amax_all(ctx, &J, M, amax_a_rows));
@@ -1291,6 +1462,13 @@ static int gemm_front(rk_ctx *ctx, int prec, int batch, int M, int N, int K,
 			J.out_mul = 1.f / (J.a_scale * J.b_scale);
 			J.amax_part = NULL;
 			ctx->stats.pack_us += now_us() - t0;
+		} else if (prec == RK_PREC_FP16 && ctx->autoscale >= 2) {
+			/* optimistic: pack at scale 1 and check the packed fp16 range (half the bytes of a scan of the
+			 * fp32 source); only operands outside [2^-10, 65504] get scanned and packed again with a
+			 * power-of-two scale. Same results as autoscale 1 whenever no rescale is needed. */
+			J.b_scale = hit ? hit->scale : 1.f;
+			J.opt_a = 1;
+			J.opt_b = !hit;
 		}
 		if (!hit && ctx->wc_key && batch == 1) {
 			fresh = wc_new(ctx, 1, prec, wd, 2, (size_t)round_up(K, 32) * round_up(N, 32) * 2);
@@ -1551,9 +1729,22 @@ static void conv_pack_x(void *v, int b, int e) {
 		const float *src[8];
 		for (int t = 0; t < 8; t++)
 			src[t] = (c0 + t < J->Cg) ? J->x + ((size_t)bb * J->C + (size_t)gr * J->Cg + c0 + t) * HW : NULL;
-		for (int p = 0; p < HW; p++)
-			for (int t = 0; t < 8; t++)
-				d[(size_t)p * 8 + t] = h16(J, src[t] ? src[t][p] * J->xs : 0.f);
+		int p0 = 0;
+#if HAVE_NEON8
+		if (c0 + 8 <= J->Cg) {
+			/* NCHW -> [H][W][8]: 8 channel rows x 8 pixels transposed in registers */
+			const float sc = J->bf16 ? 1.f : J->xs;
+			for (; p0 + 8 <= HW; p0 += 8)
+				tr8x8_cvt(src[0] + p0, HW, d + (size_t)p0 * 8, 8, sc, J->bf16);
+		}
+#endif
+		if (J->bf16) {
+			for (int p = p0; p < HW; p++)
+				for (int t = 0; t < 8; t++) d[(size_t)p * 8 + t] = src[t] ? f32_to_bf16(src[t][p]) : 0;
+		} else {
+			for (int p = p0; p < HW; p++)
+				for (int t = 0; t < 8; t++) d[(size_t)p * 8 + t] = h16(J, src[t] ? src[t][p] * J->xs : 0.f);
+		}
 	}
 }
 
@@ -1585,6 +1776,40 @@ static void conv_unpack_y(void *v, int b, int e) {
 	const int relu = J->relu && !J->relu_dpu;
 	for (int it = b; it < e; it++) {
 		int o = it % J->O, bb = it / J->O, gr = o / J->Og, ol = o % J->Og;
+#if HAVE_NEON8
+		if (J->nk == 1 && (ol & 3) == 0 && ol + 4 <= J->Og && it + 4 <= e) {
+			/* 4 channels at once: [p][4] atoms de-interleaved with LD4 */
+			const float *src = J->yp + (size_t)gr * J->y_grp + (size_t)bb * J->y_img + (size_t)(ol / 4) * OHW * 4;
+			float *d[4];
+			float32x4_t bias[4];
+			for (int c = 0; c < 4; c++) {
+				d[c] = J->y + ((size_t)bb * J->O + o + c) * OHW;
+				bias[c] = vdupq_n_f32(J->bias ? J->bias[o + c] : 0.f);
+			}
+			const float32x4_t mul = vdupq_n_f32(J->out_mul), zero = vdupq_n_f32(0.f);
+			int p = 0;
+			for (; p + 4 <= OHW; p += 4) {
+				float32x4x4_t v = vld4q_f32(src + (size_t)p * 4);
+				for (int c = 0; c < 4; c++) {
+					float32x4_t a = vmulq_f32(v.val[c], mul);
+					if (J->accumulate) a = vaddq_f32(a, vld1q_f32(d[c] + p));
+					a = vaddq_f32(a, bias[c]);
+					if (relu) a = vmaxq_f32(a, zero);
+					vst1q_f32(d[c] + p, a);
+				}
+			}
+			for (; p < OHW; p++)
+				for (int c = 0; c < 4; c++) {
+					float acc = src[(size_t)p * 4 + c] * J->out_mul;
+					if (J->accumulate) acc += d[c][p];
+					acc += J->bias ? J->bias[o + c] : 0.f;
+					if (relu && acc < 0.f) acc = 0.f;
+					d[c][p] = acc;
+				}
+			it += 3;
+			continue;
+		}
+#endif
 		float *d = J->y + ((size_t)bb * J->O + o) * OHW;
 		const float *src = J->yp + (size_t)gr * J->y_grp + (size_t)bb * J->y_img + (size_t)(ol / 4) * OHW * 4 + (ol & 3);
 		const float bias = J->bias ? J->bias[o] : 0.f;
@@ -1669,6 +1894,14 @@ int rk_conv2d_ex(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float 
 	if (dbanks_all > dbanks_max) dbanks_all = dbanks_max;
 	wbanks = CBUF_BANKS - dbanks_all;
 	int weights_fit = wall <= (long)wbanks * CBUF_BANK_SIZE;
+	/* Erratum (found with tests/test_conv.py's padding sweep): with 2 or more rows of zero padding at the
+	 * top or bottom, a task that reuses the weights already in CBUF (CBUF_WEIGHT_REUSE) from the previous
+	 * task computes wrong results, typically for every second image (e.g. C=96, 5x5 input, 3x3 kernel,
+	 * padding 2; 5x5 kernels with padding 2-4). Sizing the data banks for the padded rows does not help;
+	 * reloading the weights does. Large-padding convolutions mostly come from backward passes (dX of a
+	 * "valid" convolution pads by k-1), so reload the weights for every task there. */
+	int pad_bottom = (oh - 1) * sy + kh - H - pt;
+	int reuse_ok = (pt < 2 && pad_bottom < 2) || env_int("RKNPU_CONV_REUSE_PAD", 0);   /* 1 = old behaviour */
 	int T = G * N * nk * nslice;
 	if (T > 64 * PC_TASK_LIMIT) { set_err(ctx, "convolution needs too many NPU tasks (%d)", T); return -1; }
 
@@ -1710,13 +1943,32 @@ int rk_conv2d_ex(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float 
 	J.relu_dpu = J.relu && !J.bias && nk == 1 && !accumulate;
 
 	double t0 = now_us();
-	if (!J.bf16 && ctx->autoscale) {
+	const int opt = !J.bf16 && ctx->autoscale >= 2;    /* optimistic fp16 scaling, as in gemm_front */
+	if (!J.bf16 && ctx->autoscale == 1) {
 		J.xs = pow2_scale(amax_par(ctx, x, (size_t)N * C * H * W));
 		J.ws = pack_w ? pow2_scale(amax_par(ctx, w, (size_t)O * Cg * khw)) : wc->scale;
-		J.out_mul = 1.f / (J.xs * J.ws);
+	} else if (opt && !pack_w) {
+		J.ws = wc->scale;
 	}
 	parallel_for(ctx, G * N * nk * (Cc / 8), 1, conv_pack_x, &J);
-	if (pack_w) parallel_for(ctx, G * nk * (Op / 16), 1, conv_pack_w, &J);
+	if (opt && !f16_range_ok(hmax_par(ctx, J.xp, xb / 2))) {
+		float amax = amax_par(ctx, x, (size_t)N * C * H * W);
+		if (amax != 0.f) {
+			J.xs = pow2_scale(amax);
+			parallel_for(ctx, G * N * nk * (Cc / 8), 1, conv_pack_x, &J);
+		}
+	}
+	if (pack_w) {
+		parallel_for(ctx, G * nk * (Op / 16), 1, conv_pack_w, &J);
+		if (opt && !f16_range_ok(hmax_par(ctx, J.wp, wb / 2))) {
+			float amax = amax_par(ctx, w, (size_t)O * Cg * khw);
+			if (amax != 0.f) {
+				J.ws = pow2_scale(amax);
+				parallel_for(ctx, G * nk * (Op / 16), 1, conv_pack_w, &J);
+			}
+		}
+	}
+	J.out_mul = 1.f / (J.xs * J.ws);
 	ctx->stats.pack_us += now_us() - t0;
 	buf_sync(ctx, &ctx->a, xb, RKNPU_MEM_SYNC_TO_DEVICE);
 	if (pack_w) {
@@ -1761,7 +2013,7 @@ int rk_conv2d_ex(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float 
 		task_desc d = {
 			.dt = dt, .m = in_rows, .k = Cc, .n = Op, .grains = in_rows + 1,
 			.dbanks = dbanks, .wbanks = CBUF_BANKS - dbanks,
-			.reuse = ctx->reuse && weights_fit && !first && (sl > 0 || bb > 0) && nk == 1,
+			.reuse = ctx->reuse && reuse_ok && weights_fit && !first && (sl > 0 || bb > 0) && nk == 1,
 			.in_dma = (uint32_t)(ctx->a.dma + xo * 2),
 			.w_dma = (uint32_t)(w_dma + ((size_t)gr * J.w_grp + (size_t)j * J.w_chunk) * 2),
 			.out_dma = (uint32_t)(ctx->c.dma + yo * 4),

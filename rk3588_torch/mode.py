@@ -5,12 +5,14 @@
         loss.backward()
 
 Inside the context, F.linear, matmul / mm / bmm / addmm / baddbmm, two-operand
-torch.einsum, F.scaled_dot_product_attention, F.conv1d / F.conv2d and F.conv_transpose2d
+torch.einsum, F.scaled_dot_product_attention, F.multi_head_attention_forward (nn.MultiheadAttention,
+nn.Transformer*), F.conv1d / F.conv2d and F.conv_transpose2d
 on CPU float tensors run on the NPU (forward and backward); every other op stays on the
-CPU. Convolutions use the NPU's native convolution engine (dilation 1; grouped convolutions
+CPU. Convolutions use the NPU's native convolution engine (dilated ones via space-to-batch; grouped convolutions
 when the groups aren't too thin; depthwise ones stay on the CPU). Biases are added in the
 NPU library's output stage. If no NPU is available everything simply runs on the CPU.
 """
+import inspect
 import os
 import threading
 
@@ -26,6 +28,7 @@ _ADDMM_FUNCS = {torch.addmm, torch.Tensor.addmm}
 _BADDBMM_FUNCS = {torch.baddbmm, torch.Tensor.baddbmm}
 _SDPA = getattr(F, "scaled_dot_product_attention", None)
 _EINSUM = {torch.einsum, torch.functional.einsum} if hasattr(torch, "functional") else {torch.einsum}
+_MHA_SIG = inspect.signature(F.multi_head_attention_forward)
 
 
 _UPCAST_FUNCS = (_MM_FUNCS | _BMM_FUNCS | _ADDMM_FUNCS | _BADDBMM_FUNCS | _EINSUM | {F.linear}
@@ -209,8 +212,19 @@ class NPUMode(TorchFunctionMode):
             if _tensors_ok(q, k, v) and (m is None or isinstance(m, torch.Tensor)) and q.dim() >= 3:
                 L, E = q.shape[-2:]
                 S = k.shape[-2]
-                if _big_enough(q.numel() // max(E, 1) * S * E):
+                if _big_enough(q.numel() // max(E, 1) * S * E) and ops.attention_on_npu(L, S, E):
                     return ops.scaled_dot_product_attention(q, k, v, **params)
+            return None
+        if self.attention and func is F.multi_head_attention_forward:
+            try:
+                bound = _MHA_SIG.bind(*args, **kwargs)
+            except TypeError:
+                return None
+            q = bound.arguments.get("query")
+            tens = [t for t in bound.arguments.values() if isinstance(t, torch.Tensor) and t.is_floating_point()]
+            if isinstance(q, torch.Tensor) and q.dim() == 3 and _tensors_ok(*tens) \
+                    and _big_enough(q.shape[0] * q.shape[1] * q.shape[2] * q.shape[2]):
+                return ops.multi_head_attention_forward(**bound.arguments)
             return None
         if self.conv and func in (F.conv2d, F.conv1d):
             x, w = args[0], args[1]
@@ -328,9 +342,7 @@ class NPUConv2d(torch.nn.Conv2d):
     fused_relu = False
 
     def forward(self, x):
-        if (self.padding_mode == "zeros" and isinstance(self.padding, tuple) and ops._enabled
-                and ops._usable(x, self.weight) and x.dim() == 4
-                and ops.conv_supported(x, self.weight, self.stride, self.padding, self.dilation, self.groups)):
+        if self.padding_mode == "zeros" and ops._enabled and ops._usable(x, self.weight) and x.dim() == 4:
             y = ops.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups,
                            "relu" if self.fused_relu else None)
             if y is not None:
@@ -344,8 +356,7 @@ class NPUConv1d(torch.nn.Conv1d):
     fused_relu = False
 
     def forward(self, x):
-        if (self.padding_mode == "zeros" and isinstance(self.padding, tuple) and ops._enabled
-                and ops._usable(x, self.weight)):
+        if self.padding_mode == "zeros" and ops._enabled and ops._usable(x, self.weight):
             y = ops.conv1d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups,
                            "relu" if self.fused_relu else None)
             if y is not None:
