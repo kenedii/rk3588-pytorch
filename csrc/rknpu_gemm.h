@@ -28,6 +28,7 @@ typedef struct {
 	int    m_tile, k_tile, n_tile;
 	double sync_us;     /* CPU cache maintenance (MEM_SYNC ioctls) */
 	int    cache_hits;  /* weight operands taken from the packed-weight cache */
+	int    waves;       /* pipeline waves of the last GEMM (1 = not pipelined; pack/unpack then overlap submit) */
 } rk_stats;
 
 /* Opens the NPU DRM node (NULL = auto-detect the "rknpu" card). Returns NULL on failure. */
@@ -86,6 +87,17 @@ typedef struct {
 	uint32_t freq_hz;
 } rk_info;
 int rk_query(rk_ctx *ctx, rk_info *info);
+
+/* Fused CPU element-wise ops (NEON, the library's thread pool), fp32 or bf16 (bf16 = 1) tensors:
+ * op 0/1 GELU fwd/bwd, 2/3 GELU-tanh fwd/bwd, 4/5 SiLU fwd/bwd (y = op(x[, g]) over rows*D elements),
+ * 6/7 RMSNorm fwd/bwd over rows x D (w optional; aux = per-row rstd, fp32; dw = fp32 weight grad, optional). */
+int rk_eltwise(rk_ctx *ctx, int op, int bf16, const void *x, const void *g, const void *w, void *y, float *aux,
+               float *dw, long rows, long D, float eps);
+
+/* Depthwise conv on the CPU (NCHW fp32, one KHxKW filter per channel, stride sy/sx, top/left padding pt/pl,
+ * output OHxOW): op 0 out = y from x, w; op 1 out = dx from dy, w; op 2 out = dw (C,KH,KW) from x, dy. */
+int rk_dwconv(rk_ctx *ctx, int op, const float *x, const float *w, const float *dy, float *out,
+              int N, int C, int H, int W, int KH, int KW, int sy, int sx, int pt, int pl, int OH, int OW);
 
 /* Hardware probing: one task, raw bytes, caller-chosen precision codes (M%4==0, K%32==0, N%16==0;
  * a_rows is M x K row-major, w_bytes is N*K elements in the NPU weight layout). */

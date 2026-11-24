@@ -402,7 +402,7 @@ def run_case(name, mk, mkin, loss_fn, precision, reps, tol):
     del m
     gc.collect()
     # NPU
-    m = copy.deepcopy(base)
+    m = rt.convert(copy.deepcopy(base))     # the recommended usage: convert() + npu_mode()
     ops.stats(reset=True)
     times = []
     with rt.npu_mode(precision=precision):
