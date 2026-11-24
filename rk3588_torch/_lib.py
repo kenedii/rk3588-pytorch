@@ -107,6 +107,8 @@ def _load():
     lib.rk_set_threads.argtypes = [vp, i]
     lib.rk_set_max_m_tile.argtypes = [vp, i]
     lib.rk_get_stats.argtypes = [vp, ctypes.POINTER(RkStats)]
+    lib.rk_eltwise.argtypes = [vp, i, i, vp, vp, vp, vp, vp, vp, ctypes.c_long, ctypes.c_long, ctypes.c_float]
+    lib.rk_eltwise.restype = i
     lib.rk_gemm_batched.argtypes = [vp, i, i, i, i, i, fp, i64, i64, i64, fp, i64, i64, i64, fp, i64, i64, i]
     lib.rk_gemm_batched.restype = i
     lib.rk_release.argtypes = [vp]
@@ -152,6 +154,12 @@ class NPU:
             self.close()
         except Exception:
             pass
+
+    def eltwise(self, op, bf16, x, g, w, y, aux, dw, rows, D, eps=0.0):
+        """Fused CPU element-wise kernel (see rk_eltwise); pointer arguments are ints (0 = NULL)."""
+        with self.lock:
+            return self.lib.rk_eltwise(self.ctx, int(op), int(bf16), x or None, g or None, w or None, y or None,
+                                       aux or None, dw or None, int(rows), int(D), float(eps))
 
     def set_mode(self, mode):
         self.lib.rk_set_mode(self.ctx, int(mode))

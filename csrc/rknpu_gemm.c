@@ -2285,3 +2285,5 @@ int rk_conv2d(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float *x,
               int oh, int ow, float *y, int accumulate) {
 	return rk_conv2d_grouped(ctx, prec, N, C, H, W, x, O, kh, kw, w, sy, sx, pt, pl, oh, ow, y, accumulate, 1);
 }
+
+#include "rknpu_eltwise.c"

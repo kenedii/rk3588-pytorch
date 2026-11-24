@@ -222,9 +222,9 @@ more (Llama-style 1.99x, GPT 1.82x) and DCGAN reaches 4.2x.
 | ResNet-18 (BatchNorm, 7x7 stem) | 16 x 3x64x64 | 1219 ms | 355 ms | **3.43x** | 1.1e-1 | 1.0e-1 |
 | DCGAN generator (ConvTranspose 4x4 s2) | 32 x 100 | 767 ms | 285 ms | **2.69x** | 1.1e-2 | 1.4e-2 |
 | Dense GCN (A·X·W) | 1024 nodes | 56 ms | 25 ms | **2.24x** | 4.5e-4 | 2.0e-3 |
-| GPT (causal SDPA, tied embeddings) | 8 x 256 tokens | 2263 ms | 1187 ms | 1.91x | 3.1e-4 | 3.0e-4 |
+| GPT (causal SDPA, tied embeddings) | 8 x 256 tokens | 2309 ms | 1118 ms | **2.07x** | 3.1e-4 | 3.0e-4 |
 | Llama-style LM (RMSNorm, RoPE, GQA, SwiGLU) | 4 x 256 tokens | 947 ms | 505 ms | 1.88x | 1.2e-3 | 2.0e-3 |
-| ViT (patch conv + nn.TransformerEncoder) | 32 x 3x64x64 | 1016 ms | 605 ms | 1.68x | 8.0e-4 | 7.6e-4 |
+| ViT (patch conv + nn.TransformerEncoder) | 32 x 3x64x64 | 1042 ms | 574 ms | 1.81x | 8.0e-4 | 7.6e-4 |
 | BERT-style encoder, key padding mask | 16 x 128 tokens | 687 ms | 417 ms | 1.65x | 5.6e-4 | 6.2e-4 |
 | VAE (MLP encoder/decoder) | 256 x 784 | 106 ms | 65 ms | 1.63x | 1.0e-3 | 1.6e-3 |
 | TCN, dilated Conv1d (d = 1..8) | 16 x 2000 | 1226 ms | 814 ms | 1.51x | 2.6e-4 | 4.7e-3 |
@@ -429,6 +429,13 @@ Things that had to be discovered to make this work on a current kernel/driver:
   flash attention was faster for every head dim up to 64 (by 10-60%, lengths 65-1024); at head dim 128
   the NPU wins. So by default attention goes to the NPU only from head dim 128 (`RKNPU_ATTENTION`); this
   alone took GPT from 1.65x to 1.93x and ViT from 1.33x to 1.74x per training step.
+* **Fused NEON kernels for the CPU's element-wise work.** With the matmuls on the NPU, a transformer step's
+  GELU, SiLU and RMSNorm become a visible share of it, and PyTorch's aarch64 wheel runs them through its generic
+  kernels (`CPU capability usage: DEFAULT`). `rk3588_torch.eltwise` does each forward and backward in one NEON
+  pass (exp to ~2 ulp, erf to 1.5e-7) on the library's thread pool, for fp32 and bf16 tensors: on 2048 x 1536,
+  GELU forward + backward 60 -> 15 ms, RMSNorm 26 -> 7.5 ms, SiLU 16 -> 12.5 ms. `npu_mode()` routes `F.gelu`,
+  `F.silu` and `F.rms_norm` (so `nn.GELU`, `nn.SiLU`, `nn.RMSNorm`) to them, and `convert()` replaces Hugging
+  Face-style `*RMSNorm` modules (Qwen2, Llama, ...). GPT in the zoo: 1.95x -> 2.07x.
 * **The NPU is often DRAM-bound, so the K split is planned.** The CBUF (384 KB) holds a tile of A rows and
   either all of the weights or a streamed slice of them. With a long K (e.g. 8192) only a dozen rows of A fit,
   so the whole weight matrix is re-read from DRAM for every dozen rows: the DDR controller's counters
@@ -487,6 +494,7 @@ Things that had to be discovered to make this work on a current kernel/driver:
 | `tests/test_robust.py` | Fallbacks, verification, batching, attention, `convert()`, `torch.compile`, tools |
 | `tests/test_zoo.py` | 17 architectures: one training step CPU vs NPU, gradient error vs the precision's own error, speed (`--fake` runs without an NPU) |
 | `tests/diag_zoo.py` | per-parameter gradient error and a profile for one zoo model |
+| `tests/test_eltwise.py` | fused GELU / SiLU / RMSNorm kernels vs PyTorch (fp32, bf16, extremes), routing and the HF RMSNorm swap |
 | `tests/test_dilated.py` | dilated, `"same"` and asymmetric-padded convolutions (space-to-batch), forward and backward |
 | `bench/bench_gemm.py` | CPU vs NPU GEMM throughput |
 | `bench/bench_precision.py` | Speed and error of every precision mode |
@@ -518,6 +526,7 @@ experimenting:
 | `RKNPU_MAX_FAILURES` | `3` | NPU errors before it is disabled for the rest of the process |
 | `RKNPU_DISABLE` | `0` | `1` = run everything on the CPU (same code path, for A/B tests) |
 | `RKNPU_AUTOSCALE` | `2` | power-of-two scaling in `fp16` mode: `2` optimistic (pack at scale 1, rescale only operands outside [2^-10, 65504]), `1` always scan first, `0` off (values above 65504 overflow) |
+| `RKNPU_ELTWISE` | `1` | fused NEON GELU / SiLU / RMSNorm kernels under `npu_mode()` and in `convert()` (`RKNPU_ELTWISE_MIN`: smallest tensor, 32768 elements) |
 | `RKNPU_KPLAN` | `1` | choose each GEMM's K split with the DRAM/compute cost model (`0`: one chunk up to `RKNPU_MAX_K`); `RKNPU_PLAN_GMACS` / `_NPU_GBS` / `_CPU_GBS` (680 / 20 / 3) are its constants |
 | `RKNPU_PIPELINE` | `1` | waves to split a GEMM into to overlap CPU packing with the NPU (1 = off; see How it works) |
 | `RKNPU_ATTENTION` | `auto` | where the attention GEMMs run: `auto` = NPU only for head dim >= 128 (PyTorch's fused CPU flash attention is faster below that), `npu` = always, `cpu` = never. Projections always use the NPU |

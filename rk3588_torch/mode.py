@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch.overrides import TorchFunctionMode
 
-from . import ops
+from . import eltwise, ops
 
 _MM_FUNCS = {torch.mm, torch.Tensor.mm, torch.matmul, torch.Tensor.matmul, torch.Tensor.__matmul__}
 _BMM_FUNCS = {torch.bmm, torch.Tensor.bmm}
@@ -29,6 +29,33 @@ _BADDBMM_FUNCS = {torch.baddbmm, torch.Tensor.baddbmm}
 _SDPA = getattr(F, "scaled_dot_product_attention", None)
 _EINSUM = {torch.einsum, torch.functional.einsum} if hasattr(torch, "functional") else {torch.einsum}
 _MHA_SIG = inspect.signature(F.multi_head_attention_forward)
+
+
+def _gelu(args, kw):
+    if len(args) != 1 or set(kw) - {"approximate"}:
+        return None
+    return eltwise.gelu(args[0], kw.get("approximate", "none"))
+
+
+def _silu(args, kw):
+    if len(args) != 1 or kw.get("inplace"):
+        return None
+    return eltwise.silu(args[0])
+
+
+def _rms(args, kw):
+    try:
+        b = inspect.signature(F.rms_norm).bind(*args, **kw)
+    except TypeError:
+        return None
+    a = b.arguments
+    return eltwise.rms_norm(a["input"], a["normalized_shape"], a.get("weight"), a.get("eps"))
+
+
+# fused CPU element-wise kernels (rk3588_torch/eltwise.py)
+_ELTWISE = {F.gelu: _gelu, F.silu: _silu}
+if hasattr(F, "rms_norm"):
+    _ELTWISE[F.rms_norm] = _rms
 
 
 _UPCAST_FUNCS = (_MM_FUNCS | _BMM_FUNCS | _ADDMM_FUNCS | _BADDBMM_FUNCS | _EINSUM | {F.linear}
@@ -169,6 +196,8 @@ class NPUMode(TorchFunctionMode):
         return func(*args, **kwargs)
 
     def _route(self, func, args, kwargs):
+        if func in _ELTWISE and eltwise.ENABLED:
+            return _ELTWISE[func](args, kwargs)
         if self.linear and func is F.linear:
             x, w = args[0], args[1]
             b = args[2] if len(args) > 2 else kwargs.get("bias")
@@ -401,7 +430,13 @@ def convert(model, fuse_relu=True):
     if type(model) in _SWAP:
         model.__class__ = _SWAP[type(model)]
         return model
-    for _, child in list(model.named_children()):
+    for name, child in list(model.named_children()):
+        # Hugging Face-style RMSNorm (Qwen2RMSNorm, LlamaRMSNorm, ...: weight + variance_epsilon, written as four
+        # separate ops) -> one fused NEON kernel each way
+        if (type(child).__name__.endswith("RMSNorm") and isinstance(getattr(child, "weight", None), torch.nn.Parameter)
+                and isinstance(getattr(child, "variance_epsilon", None), float) and not child._forward_hooks):
+            model._modules[name] = eltwise.RMSNorm(child.weight, child.variance_epsilon)
+            continue
         convert(child, fuse_relu)
     if fuse_relu and isinstance(model, torch.nn.Sequential):
         mods = list(model._modules.items())
