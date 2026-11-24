@@ -834,6 +834,46 @@ def _conv_setup(ctx, inputs, output):
     ctx.bias_dtype = bias.dtype if bias is not None else None
 
 
+# Weight gradient of a convolution. dW = dY (O x N*L) @ unfold(X)^T (N*L x C*kh*kw). unfold gives
+# (N, C*kh*kw, L); laying it out as one (N*L, C*kh*kw) matrix means a full copy of the im2col matrix (113 MB
+# for an 8 x 96 x 64 x 64 3x3 layer: ~45% of a UNet training step), so instead each image's (L x C*kh*kw)
+# operand is a transposed *view* and one batched GEMM sums over images. That trades the copy (N*L*CK elements)
+# for N partial results (N*O*CK), so it wins when the image has more positions than the layer has output
+# channels (measured on the Rock 5B: every layer with L >= 4*O gained 1.2-3.6x, every one with L <= 0.8*O lost,
+# down to 0.2x at 512 channels on 7x7 maps) and enough of them (L >= 256) for its own K to keep the NPU busy.
+# RKNPU_DW_MODE = auto | copy | batched.
+DW_MODE = os.environ.get("RKNPU_DW_MODE", "auto")
+DW_MIN_L = int(os.environ.get("RKNPU_DW_MIN_L", "256"))
+DW_RATIO = float(os.environ.get("RKNPU_DW_RATIO", "2"))
+DW_CHUNK_ELEMS = int(os.environ.get("RKNPU_DW_CHUNK_MB", "32")) * (1 << 20) // 4     # partial dW results per call
+
+
+def _conv_weight_grad(x, g, wshape, st, pd, G, precision):
+    O, Cg, kh, kw = wshape
+    N, C = x.shape[:2]
+    Og = O // G
+    cols = torch.nn.functional.unfold(x.float(), (kh, kw), padding=pd, stride=st)       # N, C*kh*kw, L
+    L = cols.shape[2]
+    CK = Cg * kh * kw
+    if G == 1 and (DW_MODE == "batched" or (DW_MODE == "auto" and L >= DW_MIN_L and L >= DW_RATIO * O)):
+        gm = g.reshape(N, O, L)
+        nb = max(1, min(N, DW_CHUNK_ELEMS // max(1, O * CK)))
+        acc = None
+        for i in range(0, N, nb):
+            part = torch.ops.rknpu.mm(gm[i:i + nb], cols[i:i + nb].transpose(1, 2), precision).sum(0)
+            acc = part if acc is None else acc.add_(part)
+        gw = acc
+    elif G == 1:
+        gm = g.reshape(N, O, L).permute(1, 0, 2).reshape(O, N * L)
+        cm = cols.permute(0, 2, 1).reshape(N * L, CK)
+        gw = torch.ops.rknpu.mm(gm, cm, precision)
+    else:
+        gm = g.reshape(N, G, Og, L).permute(1, 2, 0, 3).reshape(G, Og, N * L)
+        cm = cols.reshape(N, G, CK, L).permute(1, 0, 3, 2).reshape(G, N * L, CK)
+        gw = torch.ops.rknpu.mm(gm, cm, precision)
+    return gw.reshape(O, Cg, kh, kw)
+
+
 def _conv_backward(ctx, g):
     x, w, y = ctx.saved_tensors
     (sy, sx), (pt, pl), G = ctx.stride, ctx.padding, ctx.groups
@@ -862,18 +902,7 @@ def _conv_backward(ctx, g):
             gx = torch.nn.grad.conv2d_input(x.shape, w.float(), g, stride=(sy, sx), padding=(pt, pl), groups=G)
         gx = gx.to(x.dtype)
     if ctx.needs_input_grad[1]:
-        # dW = dY (O x N*L) @ unfold(X)^T (N*L x C*kh*kw): one NPU GEMM (one batched GEMM per group)
-        cols = torch.nn.functional.unfold(x.float(), (kh, kw), padding=(pt, pl), stride=(sy, sx))   # N, C*kh*kw, L
-        L = cols.shape[2]
-        if G == 1:
-            gm = g.reshape(N, O, L).permute(1, 0, 2).reshape(O, N * L)
-            cm = cols.permute(0, 2, 1).reshape(N * L, C * kh * kw)
-            gw = torch.ops.rknpu.mm(gm, cm, ctx.precision)
-        else:
-            gm = g.reshape(N, G, Og, L).permute(1, 2, 0, 3).reshape(G, Og, N * L)
-            cm = cols.reshape(N, G, Cg * kh * kw, L).permute(1, 0, 3, 2).reshape(G, N * L, Cg * kh * kw)
-            gw = torch.ops.rknpu.mm(gm, cm, ctx.precision)
-        gw = gw.reshape(O, Cg, kh, kw).to(w.dtype)
+        gw = _conv_weight_grad(x, g, w.shape, (sy, sx), (pt, pl), G, ctx.precision).to(w.dtype)
     if ctx.has_bias and ctx.needs_input_grad[2]:
         gb = g.sum((0, 2, 3)).to(ctx.bias_dtype)
     return gx, gw, gb, None, None, None, None, None, None
