@@ -120,6 +120,7 @@ def _load():
     lib.rk_conv2d_grouped.argtypes = [vp, i, i, i, i, i, fp, i, i, i, fp, i, i, i, i, i, i, fp, i, i]
     lib.rk_conv2d_grouped.restype = i
     lib.rk_set_epilogue.argtypes = [vp, fp, i]
+    lib.rk_set_bgather.argtypes = [vp, ctypes.POINTER(ctypes.c_int)]
     lib.rk_set_wcache_key.argtypes = [vp, ctypes.c_uint64]
     lib.rk_wcache_drop.argtypes = [vp, ctypes.c_uint64]
     lib.rk_wcache_clear.argtypes = [vp]
@@ -178,8 +179,11 @@ class NPU:
     def set_max_m_tile(self, m):
         self.lib.rk_set_max_m_tile(self.ctx, int(m))
 
-    def _call(self, fn, args, bias_ptr, relu, wkey):
+    def _call(self, fn, args, bias_ptr, relu, wkey, bgather=None):
         with self.lock:
+            if bgather is not None:
+                self._bg = (ctypes.c_int * 11)(*bgather)
+                self.lib.rk_set_bgather(self.ctx, self._bg)
             if bias_ptr or relu:
                 self.lib.rk_set_epilogue(self.ctx, bias_ptr or None, 1 if relu else 0)
             if wkey:
@@ -188,6 +192,8 @@ class NPU:
             try:
                 r = fn(self.ctx, *args)
             finally:
+                if bgather is not None:
+                    self.lib.rk_set_bgather(self.ctx, None)
                 if bias_ptr or relu:
                     self.lib.rk_set_epilogue(self.ctx, None, 0)
                 if wkey:
@@ -197,11 +203,13 @@ class NPU:
             _throttle(time.perf_counter() - t0)
 
     def gemm(self, batch, M, N, K, a_ptr, sa_b, sa_m, sa_k, b_ptr, sb_b, sb_k, sb_n, c_ptr, sc_b, ldc,
-             accumulate=False, precision="fp16", bias_ptr=0, relu=False, wkey=0):
-        """C = A @ B (+ bias[n]) (ReLU); wkey != 0 caches B's packed form under that key."""
+             accumulate=False, precision="fp16", bias_ptr=0, relu=False, wkey=0, bgather=None):
+        """C = A @ B (+ bias[n]) (ReLU); wkey != 0 caches B's packed form under that key. bgather =
+        (C,H,W,kh,kw,sy,sx,pt,pl,oh,ow): b_ptr is a fp32 NCHW tensor x (sb_b = C*H*W) and B[b] is the im2col of
+        image b, (K = oh*ow) x (N = C*kh*kw), gathered while packing (fp16 / bf16)."""
         self._call(self.lib.rk_gemm_batched, (PRECISIONS[precision], batch, M, N, K, a_ptr, sa_b, sa_m, sa_k,
                                               b_ptr, sb_b, sb_k, sb_n, c_ptr, sc_b, ldc, 1 if accumulate else 0),
-                   bias_ptr, relu, wkey)
+                   bias_ptr, relu, wkey, bgather)
 
     def conv2d(self, N, C, H, W, x_ptr, O, kh, kw, w_ptr, sy, sx, pt, pl, oh, ow, y_ptr,
                accumulate=False, precision="fp16", groups=1, bias_ptr=0, relu=False, wkey=0):
