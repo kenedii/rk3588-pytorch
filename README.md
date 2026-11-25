@@ -5,7 +5,7 @@
 ### Train PyTorch models on the Rockchip RK3588 NPU
 
 **Up to 9× faster matrix multiplies and 3.5× faster training steps than the CPU,
-on a single-board computer, with one line of code.**
+on a single-board computer, with one line of code. Tested on a Radxa Rock 5B.**
 
 ![platform](https://img.shields.io/badge/platform-RK3588-blue)
 ![pytorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c)
