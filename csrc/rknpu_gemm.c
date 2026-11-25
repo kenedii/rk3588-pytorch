@@ -92,6 +92,7 @@ struct rk_ctx {
 	long     pipeline_min;     /* only for GEMMs with M*K + M*N >= this (RKNPU_PIPELINE_MIN) */
 	struct pool *pool;
 	int      autoscale;
+	volatile int nonfinite;  /* an operand scan found inf/nan (set while scaling; rk_take_nonfinite reads and clears) */
 	int      lock_fd;          /* cross-process lock (flock) or -1 */
 	size_t   max_buf;          /* cap on NPU buffer bytes per call; larger GEMMs are split */
 	float   *scr[3];
@@ -229,6 +230,8 @@ void   rk_set_bgather(rk_ctx *ctx, const int *p) {
 	ctx->bg = (bgat_t){ p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11] > 0 ? p[11] : 1 };
 	ctx->bg_on = 1;
 }
+/* 1 if a GEMM / convolution since the last call saw a non-finite operand while scaling (and clears it) */
+int    rk_take_nonfinite(rk_ctx *ctx) { int v = ctx->nonfinite; ctx->nonfinite = 0; return v; }
 void   rk_set_epilogue(rk_ctx *ctx, const float *bias, int relu) { ctx->epi_bias = bias; ctx->epi_relu = relu; }
 
 /* Find the entry for (key, kind, prec, shape); NULL if absent. */
@@ -1273,6 +1276,13 @@ static float pow2_scale(float amax) {
 	return ldexpf(1.f, sh);
 }
 
+/* pow2_scale, noting a non-finite operand: the scaling scan runs whenever the packed fp16 range check fails, which
+ * inf/nan always does, so this finds them without a pass of its own */
+static float scale_chk(rk_ctx *ctx, float amax) {
+	if (amax != amax || amax > 3e38f) ctx->nonfinite = 1;
+	return pow2_scale(amax);
+}
+
 /* ------------------------------------------------------------------------------------
  * Batching: every range function sees a per-batch view of the job
  * ---------------------------------------------------------------------------------- */
@@ -1532,7 +1542,7 @@ relayout:
 			float amax = amax_all(ctx, J, M, amax_a_rows);
 			J->amax_part = NULL;
 			if (amax != 0.f) {
-				J->a_scale = pow2_scale(amax);
+				J->a_scale = scale_chk(ctx, amax);
 				pfor_batched(ctx, J, nk * J->nblk, 4, pack_a_range);
 			}
 		}
@@ -1548,7 +1558,7 @@ relayout:
 			float amax = amax_all(ctx, J, N, amax_b_cols);
 			J->amax_part = NULL;
 			if (amax != 0.f) {
-				J->b_scale = pow2_scale(amax);
+				J->b_scale = scale_chk(ctx, amax);
 				pfor_batched(ctx, J, nk * nn * (Nc / G), 1, pb);
 			}
 		}
@@ -1671,11 +1681,11 @@ relayout:
 						J->row_lo = r0; J->row_hi = rr1;
 						J->amax_part = scratch(ctx, 0, (size_t)M);
 						parallel_for(ctx, ceil_div(rr1 - r0, 64), 1, amax_a_rows, J);
-						for (int m = r0; m < rr1; m++) if (J->amax_part[m] > amax) amax = J->amax_part[m];
+						for (int m = r0; m < rr1; m++) { float v = J->amax_part[m]; if (v != v) { amax = v; break; } if (v > amax) amax = v; }
 						J->row_lo = J->row_hi = 0; J->amax_part = NULL;
 					}
 					if (amax != 0.f) {
-						J->a_scale = pow2_scale(amax);
+						J->a_scale = scale_chk(ctx, amax);
 						for (int j = 0; j < nk; j++) parallel_for_off(ctx, j * J->nblk + b0, nbk, 4, pack_a_range, J);
 					}
 				}
@@ -1733,7 +1743,11 @@ static float amax_all(rk_ctx *ctx, job_t *J, int rows, range_fn fn) {
 	/* items are 64-row blocks; the scan functions index amax_part by row */
 	pfor_batched(ctx, J, ceil_div(rows, 64), 1, fn);
 	float mx = 0.f;
-	for (size_t i = 0; i < (size_t)rows * nb; i++) if (J->amax_part[i] > mx) mx = J->amax_part[i];
+	for (size_t i = 0; i < (size_t)rows * nb; i++) {
+		float v = J->amax_part[i];
+		if (v != v) return v;                 /* a NaN must survive the max (v > mx is false for it) */
+		if (v > mx) mx = v;
+	}
 	return mx;
 }
 
@@ -1800,8 +1814,8 @@ static int gemm_front(rk_ctx *ctx, int prec, int batch, int M, int N, int K,
 		if (prec == RK_PREC_FP16 && ctx->autoscale == 1) {
 			/* exact power-of-two scaling keeps both operands inside fp16 range */
 			t0 = now_us();
-			J.a_scale = pow2_scale(amax_all(ctx, &J, M, amax_a_rows));
-			J.b_scale = hit ? hit->scale : pow2_scale(amax_all(ctx, &J, N, amax_b_cols));
+			J.a_scale = scale_chk(ctx, amax_all(ctx, &J, M, amax_a_rows));
+			J.b_scale = hit ? hit->scale : scale_chk(ctx, amax_all(ctx, &J, N, amax_b_cols));
 			J.out_mul = 1.f / (J.a_scale * J.b_scale);
 			J.amax_part = NULL;
 			ctx->stats.pack_us += now_us() - t0;
@@ -1865,8 +1879,8 @@ static int gemm_front(rk_ctx *ctx, int prec, int batch, int M, int N, int K,
 		J.batch = 1;
 		/* C = Ah*Bh + 2^-11 * (Ah*Bl' + Al'*Bh): two NPU GEMMs, ~fp32 accuracy */
 		t0 = now_us();
-		float sa = pow2_scale(amax_all(ctx, &J, M, amax_a_rows));
-		float sb = pow2_scale(amax_all(ctx, &J, N, amax_b_cols));
+		float sa = scale_chk(ctx, amax_all(ctx, &J, M, amax_a_rows));
+		float sb = scale_chk(ctx, amax_all(ctx, &J, N, amax_b_cols));
 		float *A2 = scratch(ctx, 1, (size_t)M * 2 * K), *B2 = scratch(ctx, 2, (size_t)2 * K * N);
 		if (!A2 || !B2) { set_err(ctx, "out of memory"); return -1; }
 		job_t S = J;
@@ -2351,8 +2365,8 @@ int rk_conv2d_ex(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float 
 	double t0 = now_us();
 	const int opt = !J.bf16 && ctx->autoscale >= 2;    /* optimistic fp16 scaling, as in gemm_front */
 	if (!J.bf16 && ctx->autoscale == 1) {
-		J.xs = pow2_scale(amax_par(ctx, x, (size_t)N * C * H * W));
-		J.ws = pack_w ? pow2_scale(amax_par(ctx, w, (size_t)O * Cg * khw)) : wc->scale;
+		J.xs = scale_chk(ctx, amax_par(ctx, x, (size_t)N * C * H * W));
+		J.ws = pack_w ? scale_chk(ctx, amax_par(ctx, w, (size_t)O * Cg * khw)) : wc->scale;
 	} else if (opt && !pack_w) {
 		J.ws = wc->scale;
 	}
@@ -2360,7 +2374,7 @@ int rk_conv2d_ex(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float 
 	if (opt && !f16_range_ok(hmax_par(ctx, J.xp, xb / 2))) {
 		float amax = amax_par(ctx, x, (size_t)N * C * H * W);
 		if (amax != 0.f) {
-			J.xs = pow2_scale(amax);
+			J.xs = scale_chk(ctx, amax);
 			parallel_for(ctx, G * N * nk * (Cc / 8), 1, conv_pack_x, &J);
 		}
 	}
@@ -2369,7 +2383,7 @@ int rk_conv2d_ex(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float 
 		if (opt && !f16_range_ok(hmax_par(ctx, J.wp, wb / 2))) {
 			float amax = amax_par(ctx, w, (size_t)O * Cg * khw);
 			if (amax != 0.f) {
-				J.ws = pow2_scale(amax);
+				J.ws = scale_chk(ctx, amax);
 				parallel_for(ctx, G * nk * (Op / 16), 1, conv_pack_w, &J);
 			}
 		}

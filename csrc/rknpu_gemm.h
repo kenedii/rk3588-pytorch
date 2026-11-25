@@ -124,6 +124,7 @@ int rk_conv2d_grouped(rk_ctx *ctx, int prec, int N, int C, int H, int W, const f
  * y = relu?(y + bias), bias indexed by output column (GEMM) or output channel (conv);
  * bias = NULL for none. The ReLU runs in the NPU's DPU when nothing is added afterwards. */
 void rk_set_epilogue(rk_ctx *ctx, const float *bias, int relu);
+int  rk_take_nonfinite(rk_ctx *ctx);
 /* p = {C,H,W,kh,kw,sy,sx,pt,pl,oh,ow,nimg} (or NULL to clear): the GEMM reads B (K=nimg*oh*ow x N=C*kh*kw) as the
  * im2col of the nimg images of x (fp32 NCHW, passed as B), stacked along K. fp16 / bf16 only. */
 void rk_set_bgather(rk_ctx *ctx, const int *p);

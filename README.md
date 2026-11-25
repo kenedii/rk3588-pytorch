@@ -533,7 +533,7 @@ experimenting:
 | `RKNPU_PRECISION` | `fp16` | default precision (`fp16`, `bf16`, `int8`, `fp16x3`, `fp16_out16`) |
 | `RKNPU_MIN_MACS` | calibrated | smallest op (multiply-adds) sent to the NPU; unset = measured on first use and cached in `~/.cache/rk3588_torch/` |
 | `RKNPU_VERIFY` | `first` | check each new shape against a CPU sample: `first`, `always`, or `off` |
-| `RKNPU_CHECK_FINITE` | `1` | send ops whose inputs contain inf/nan to the CPU (the NPU turns them into finite values, which would hide a diverging run); `0` saves one reduction per input (~5-10% on large GEMMs) |
+| `RKNPU_CHECK_FINITE` | `1` | send ops whose inputs contain inf/nan to the CPU (the NPU turns them into finite values, which would hide a diverging run). The default lets the engine report non-finite fp16 operands from the scan it already does while scaling (no extra pass; GPT 2.19x -> 2.32x, BERT 1.61x -> 1.73x); `full` scans every operand and output in Python as before; `0` disables the check |
 | `RKNPU_MAX_FAILURES` | `3` | NPU errors before it is disabled for the rest of the process |
 | `RKNPU_DISABLE` | `0` | `1` = run everything on the CPU (same code path, for A/B tests) |
 | `RKNPU_AUTOSCALE` | `2` | power-of-two scaling in `fp16` mode: `2` optimistic (pack at scale 1, rescale only operands outside [2^-10, 65504]), `1` always scan first, `0` off (values above 65504 overflow) |

@@ -120,6 +120,8 @@ def _load():
     lib.rk_conv2d_grouped.argtypes = [vp, i, i, i, i, i, fp, i, i, i, fp, i, i, i, i, i, i, fp, i, i]
     lib.rk_conv2d_grouped.restype = i
     lib.rk_set_epilogue.argtypes = [vp, fp, i]
+    lib.rk_take_nonfinite.argtypes = [vp]
+    lib.rk_take_nonfinite.restype = i
     lib.rk_set_bgather.argtypes = [vp, ctypes.POINTER(ctypes.c_int)]
     lib.rk_set_wcache_key.argtypes = [vp, ctypes.c_uint64]
     lib.rk_wcache_drop.argtypes = [vp, ctypes.c_uint64]
@@ -146,6 +148,7 @@ class NPU:
                           "is this user in the 'video' and 'render' groups?) "
                           "Run `python -m rk3588_torch doctor` for details.")
         self.lock = threading.Lock()
+        self._tls = threading.local()
 
     def close(self):
         if self.ctx:
@@ -179,6 +182,12 @@ class NPU:
     def set_max_m_tile(self, m):
         self.lib.rk_set_max_m_tile(self.ctx, int(m))
 
+    @property
+    def nonfinite(self):
+        """True if the last GEMM / convolution on this thread saw an inf/nan operand while scaling (the engine's
+        scaling scan runs whenever the packed fp16 range check fails, which inf/nan always do)."""
+        return getattr(self._tls, "nonfinite", False)
+
     def _call(self, fn, args, bias_ptr, relu, wkey, bgather=None):
         with self.lock:
             if bgather is not None:
@@ -189,8 +198,10 @@ class NPU:
             if wkey:
                 self.lib.rk_set_wcache_key(self.ctx, wkey)
             t0 = time.perf_counter()
+            self.lib.rk_take_nonfinite(self.ctx)
             try:
                 r = fn(self.ctx, *args)
+                self._tls.nonfinite = bool(self.lib.rk_take_nonfinite(self.ctx))
             finally:
                 if bgather is not None:
                     self.lib.rk_set_bgather(self.ctx, None)

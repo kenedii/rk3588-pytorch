@@ -41,6 +41,14 @@ MAX_FAILURES = int(os.environ.get("RKNPU_MAX_FAILURES", "3"))
 # row (every precision, and convolutions), which would hide a diverging run or a NaN gradient.
 # So inputs are checked first (one fast reduction each) and non-finite ones go to the CPU.
 CHECK_FINITE = os.environ.get("RKNPU_CHECK_FINITE", "1") not in ("0", "false", "no")
+# RKNPU_CHECK_FINITE=full scans every operand and output in Python, as before. The default lets the engine report
+# non-finite fp16 operands from the scan it already does while scaling (no extra pass over them), and does not
+# re-scan the output (the first call of every shape is still checked against fp64).
+FULL_FINITE = os.environ.get("RKNPU_CHECK_FINITE", "1") == "full" or os.environ.get("RKNPU_AUTOSCALE", "2") == "0"
+
+
+def _engine_finite(precision):
+    return precision == "fp16" and not FULL_FINITE
 
 # bf16/fp16 operands are converted to fp32 for the NPU library. An operand pair whose fp32 copy would be
 # bigger than this many MB (an LLM's 150k-row embedding / lm_head, a huge logits gradient) is processed in
@@ -276,7 +284,8 @@ def gemm(a, b, precision=None, bias=None, relu=False, cache_b=None):
     status = _verified.get(key)
     if status is False:
         return _cpu_gemm(a, b, bias, relu)
-    if CHECK_FINITE and not (_all_finite(a) and (bias is None or _all_finite(bias))):
+    eng = CHECK_FINITE and _engine_finite(precision)                   # the engine reports non-finite A / B
+    if CHECK_FINITE and not ((eng or _all_finite(a)) and (bias is None or _all_finite(bias))):
         return _cpu_gemm(a, b, bias, relu)
     # a weight that is already in the cache was checked when it went in and hasn't changed since (the
     # cache compares a fingerprint on every hit), so it isn't scanned again; fp32, bf16 and fp16 weights
@@ -285,7 +294,7 @@ def gemm(a, b, precision=None, bias=None, relu=False, cache_b=None):
     if cache_b and b.dim() == 2 and b.dtype in _CACHEABLE and precision != "fp16x3":
         wkey, b_ok = wcache.lookup(b, cache_b, check=_all_finite if CHECK_FINITE else None)
         b_ok = b_ok or wkey != 0
-    if CHECK_FINITE and not b_ok and not _all_finite(b):
+    if CHECK_FINITE and not b_ok and not eng and not _all_finite(b):
         return _cpu_gemm(a, b, bias, relu)
     try:
         out = _npu_gemm(a, b, precision, bias, relu, wkey)
@@ -299,7 +308,9 @@ def gemm(a, b, precision=None, bias=None, relu=False, cache_b=None):
             else:
                 _warn_once("fail", f"NPU GEMM failed ({e}); this call ran on the CPU")
         return _cpu_gemm(a, b, bias, relu)
-    if not _all_finite(out):
+    if eng and default_npu().nonfinite:          # inf/nan operand: PyTorch's exact result
+        return _cpu_gemm(a, b, bias, relu)
+    if not eng and not _all_finite(out):
         if _all_finite(a) and _all_finite(b) and (bias is None or _all_finite(bias)):
             _verified[key] = False
             _stats["rejected_shapes"] += 1
@@ -754,13 +765,14 @@ def conv(x, w, stride=1, padding=0, precision=None, groups=1, bias=None, relu=Fa
     status = _verified.get(key)
     if status is False:
         return _cpu_conv(x, w, st, pd, groups, bias, relu)
-    if CHECK_FINITE and not (_all_finite(x) and (bias is None or _all_finite(bias))):
+    eng = CHECK_FINITE and _engine_finite(precision)
+    if CHECK_FINITE and not ((eng or _all_finite(x)) and (bias is None or _all_finite(bias))):
         return _cpu_conv(x, w, st, pd, groups, bias, relu)
     wkey, w_ok = 0, False
     if cache_w and w.dtype in _CACHEABLE:
         wkey, w_ok = wcache.lookup(w, cache_w, check=_all_finite if CHECK_FINITE else None)
         w_ok = w_ok or wkey != 0
-    if CHECK_FINITE and not w_ok and not _all_finite(w):
+    if CHECK_FINITE and not w_ok and not eng and not _all_finite(w):
         return _cpu_conv(x, w, st, pd, groups, bias, relu)
     if max(pd) > HW_PAD_MAX:
         # Hardware erratum: with 2+ rows of zero padding the first output rows of the first 16-kernel group
@@ -780,7 +792,9 @@ def conv(x, w, stride=1, padding=0, precision=None, groups=1, bias=None, relu=Fa
             else:
                 _warn_once("fail", f"NPU conv failed ({e}); this call ran on the CPU")
         return _cpu_conv(x, w, st, pd, groups, bias, relu)
-    bad = not _all_finite(out)
+    if eng and default_npu().nonfinite:
+        return _cpu_conv(x, w, st, pd, groups, bias, relu)
+    bad = False if eng else not _all_finite(out)
     if bad or VERIFY == "always" or (VERIFY == "first" and status is None):
         ok = not bad
         if ok:   # check a few output channels of the first, middle and last image against fp64
@@ -891,6 +905,8 @@ def _conv_wgrad_im2col(x, g, wshape, st, pd, precision):
     acc = out[0]
     _stats["npu_calls"] += 1
     _stats["npu_macs"] += N * O * CK * L
+    if default_npu().nonfinite or not math.isfinite(acc.sum().item()):   # inf/nan activations or gradients: the CPU path decides
+        return None
     if VERIFY != "off" and not _wgrad_sample_ok(xc, gc, acc, wshape, st, pd):
         _im2col_bad.add(key)
         warnings.warn("rk3588_torch: implicit-im2col weight gradient failed its check for %s; using unfold" % (key,),
