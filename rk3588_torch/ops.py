@@ -899,18 +899,12 @@ def _conv_wgrad_im2col(x, g, wshape, st, pd, precision):
     return acc.reshape(O, Cg, kh, kw)
 
 
-def _conv_weight_grad(x, g, wshape, st, pd, G, precision):
+def _conv_weight_grad_unfold(x, g, wshape, st, pd, G, precision):
     O, Cg, kh, kw = wshape
     N, C = x.shape[:2]
     Og = O // G
     L = g.shape[2] * g.shape[3]
     CK = Cg * kh * kw
-    direct = G == 1 and DW_IM2COL not in ("0", "off") and DW_MODE != "copy"     # one GEMM, K = N*L: wins at every L
-    batched = G == 1 and (DW_MODE == "batched" or (DW_MODE == "auto" and L >= DW_MIN_L and L >= DW_RATIO * O))
-    if direct:
-        gw = _conv_wgrad_im2col(x.float(), g, wshape, st, pd, precision)
-        if gw is not None:
-            return gw
     cols = torch.nn.functional.unfold(x.float(), (kh, kw), padding=pd, stride=st)       # N, C*kh*kw, L
     if G == 1 and (DW_MODE == "batched" or (DW_MODE == "auto" and L >= DW_MIN_L and L >= DW_RATIO * O)):
         gm = g.reshape(N, O, L)
@@ -929,6 +923,29 @@ def _conv_weight_grad(x, g, wshape, st, pd, G, precision):
         cm = cols.reshape(N, G, CK, L).permute(1, 0, 3, 2).reshape(G, N * L, CK)
         gw = torch.ops.rknpu.mm(gm, cm, precision)
     return gw.reshape(O, Cg, kh, kw)
+
+
+@torch.library.custom_op("rknpu::conv_wgrad_direct", mutates_args=())
+def _rknpu_conv_wgrad_direct(x: torch.Tensor, g: torch.Tensor, O: int, Cg: int, kh: int, kw: int, sy: int, sx: int,
+                             pt: int, pl: int, precision: str) -> torch.Tensor:
+    """Convolution weight gradient with the im2col gathered inside the GEMM engine; the unfold paths if the
+    direct one is not applicable (or fails its spot check)."""
+    wshape, st, pd = (O, Cg, kh, kw), (sy, sx), (pt, pl)
+    gw = _conv_wgrad_im2col(x, g, wshape, st, pd, precision)
+    return gw if gw is not None else _conv_weight_grad_unfold(x, g, wshape, st, pd, 1, precision)
+
+
+@_rknpu_conv_wgrad_direct.register_fake
+def _(x, g, O, Cg, kh, kw, sy, sx, pt, pl, precision):
+    return x.new_empty((O, Cg, kh, kw), dtype=torch.float32)
+
+
+def _conv_weight_grad(x, g, wshape, st, pd, G, precision):
+    O, Cg, kh, kw = wshape
+    if G == 1 and DW_IM2COL not in ("0", "off") and DW_MODE != "copy":   # one GEMM, K = N*L: wins at every L
+        return torch.ops.rknpu.conv_wgrad_direct(x.float(), g.float(), O, Cg, kh, kw, st[0], st[1], pd[0], pd[1],
+                                                 precision)
+    return _conv_weight_grad_unfold(x, g, wshape, st, pd, G, precision)
 
 
 def _conv_backward(ctx, g):
