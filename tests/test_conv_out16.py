@@ -6,7 +6,7 @@ bias/ReLU epilogue, groups, strides, and the fp32 redo when an fp16 output would
 import os
 import sys
 
-os.environ["RKNPU_CONV_OUT16"] = "1"
+os.environ.setdefault("RKNPU_CONV_OUT16", "1")
 import torch
 import torch.nn.functional as F
 
@@ -31,7 +31,9 @@ for (N, C, H, O, k, s, p, g, bias, act) in [
     (2, 32, 16, 32, 3, 1, 1, 1, False, None), (3, 64, 15, 48, 3, 2, 1, 1, True, None),
     (2, 32, 14, 64, 1, 1, 0, 1, True, "relu"), (1, 64, 9, 80, 3, 1, 1, 1, True, "relu"),
     (2, 64, 12, 64, 3, 1, 1, 4, True, None), (4, 16, 20, 24, 5, 1, 2, 1, False, "relu"),
-    (2, 128, 8, 256, 3, 1, 1, 1, True, None), (2, 300, 8, 40, 3, 1, 1, 1, False, None),  # nk > 1 -> fp32 path
+    (2, 128, 8, 256, 3, 1, 1, 1, True, None),
+    (8, 256, 32, 64, 1, 1, 0, 1, False, None), (8, 64, 32, 128, 3, 1, 1, 1, False, None),   # multi-slice (row-sliced) maps
+    (4, 512, 16, 128, 1, 1, 0, 1, True, "relu"), (2, 300, 8, 40, 3, 1, 1, 1, False, None),  # nk > 1 -> fp32 path
 ]:
     x = torch.randn(N, C, H, H)
     w = torch.randn(O, C // g, k, k) * 0.1

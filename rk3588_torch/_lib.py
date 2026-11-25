@@ -182,7 +182,7 @@ class NPU:
     def _call(self, fn, args, bias_ptr, relu, wkey, bgather=None):
         with self.lock:
             if bgather is not None:
-                self._bg = (ctypes.c_int * 11)(*bgather)
+                self._bg = (ctypes.c_int * 12)(*bgather)
                 self.lib.rk_set_bgather(self.ctx, self._bg)
             if bias_ptr or relu:
                 self.lib.rk_set_epilogue(self.ctx, bias_ptr or None, 1 if relu else 0)
@@ -205,8 +205,8 @@ class NPU:
     def gemm(self, batch, M, N, K, a_ptr, sa_b, sa_m, sa_k, b_ptr, sb_b, sb_k, sb_n, c_ptr, sc_b, ldc,
              accumulate=False, precision="fp16", bias_ptr=0, relu=False, wkey=0, bgather=None):
         """C = A @ B (+ bias[n]) (ReLU); wkey != 0 caches B's packed form under that key. bgather =
-        (C,H,W,kh,kw,sy,sx,pt,pl,oh,ow): b_ptr is a fp32 NCHW tensor x (sb_b = C*H*W) and B[b] is the im2col of
-        image b, (K = oh*ow) x (N = C*kh*kw), gathered while packing (fp16 / bf16)."""
+        (C,H,W,kh,kw,sy,sx,pt,pl,oh,ow,nimg): b_ptr is a fp32 NCHW tensor x of nimg images and B is
+        their im2col stacked along K, (K = nimg*oh*ow) x (N = C*kh*kw), gathered while packing (fp16 / bf16)."""
         self._call(self.lib.rk_gemm_batched, (PRECISIONS[precision], batch, M, N, K, a_ptr, sa_b, sa_m, sa_k,
                                               b_ptr, sb_b, sb_k, sb_n, c_ptr, sc_b, ldc, 1 if accumulate else 0),
                    bias_ptr, relu, wkey, bgather)

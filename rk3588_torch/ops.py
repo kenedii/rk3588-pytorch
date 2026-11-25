@@ -849,9 +849,9 @@ DW_CHUNK_ELEMS = int(os.environ.get("RKNPU_DW_CHUNK_MB", "32")) * (1 << 20) // 4
 
 
 # RKNPU_DW_IM2COL = 0 | 1: let the GEMM engine gather the im2col operand straight from x while packing it (no fp32
-# unfold matrix) for the batched weight-gradient GEMMs. Off by default: 8-25% faster per GEMM in isolation, but no
-# consistent gain in a training step (see docs/12_session4_findings.md).
-DW_IM2COL = os.environ.get("RKNPU_DW_IM2COL", "0")
+# unfold matrix) for the batched weight-gradient GEMMs (vectorised row-run gather: 2-2.3x faster than the unfold-based
+# batched path per GEMM; UNet step 2.57x -> 3.13x). 0 disables.
+DW_IM2COL = os.environ.get("RKNPU_DW_IM2COL", "1")
 _im2col_bad = set()
 
 
@@ -884,18 +884,11 @@ def _conv_wgrad_im2col(x, g, wshape, st, pd, precision):
     if key in _im2col_bad:
         return None
     xc, gc = x.contiguous(), g.contiguous()
-    gm = gc.reshape(N, O, L)
-    nb = max(1, min(N, DW_CHUNK_ELEMS // max(1, O * CK)))
-    acc = None
-    npu = default_npu()
-    for i in range(0, N, nb):
-        m = min(nb, N - i)
-        out = torch.empty((m, O, CK), dtype=torch.float32)
-        npu.gemm(m, O, CK, L, gm.data_ptr() + i * O * L * 4, O * L, L, 1, xc.data_ptr() + i * C * H * W * 4,
-                 C * H * W, 0, 0, out.data_ptr(), O * CK, CK, False, precision,
-                 bgather=(C, H, W, kh, kw, st[0], st[1], pd[0], pd[1], oh, ow))
-        part = out.sum(0) if m > 1 else out[0]
-        acc = part if acc is None else acc.add_(part)
+    gm = gc.permute(1, 0, 2, 3).reshape(O, N * L)          # one GEMM over K = N*L: no per-image partials to sum
+    out = torch.empty((1, O, CK), dtype=torch.float32)
+    default_npu().gemm(1, O, CK, N * L, gm.data_ptr(), 0, N * L, 1, xc.data_ptr(), 0, 0, 0, out.data_ptr(), 0, CK,
+                       False, precision, bgather=(C, H, W, kh, kw, st[0], st[1], pd[0], pd[1], oh, ow, N))
+    acc = out[0]
     _stats["npu_calls"] += 1
     _stats["npu_macs"] += N * O * CK * L
     if VERIFY != "off" and not _wgrad_sample_ok(xc, gc, acc, wshape, st, pd):
@@ -912,8 +905,9 @@ def _conv_weight_grad(x, g, wshape, st, pd, G, precision):
     Og = O // G
     L = g.shape[2] * g.shape[3]
     CK = Cg * kh * kw
+    direct = G == 1 and DW_IM2COL not in ("0", "off") and DW_MODE != "copy"     # one GEMM, K = N*L: wins at every L
     batched = G == 1 and (DW_MODE == "batched" or (DW_MODE == "auto" and L >= DW_MIN_L and L >= DW_RATIO * O))
-    if batched and DW_IM2COL not in ("0", "off"):
+    if direct:
         gw = _conv_wgrad_im2col(x.float(), g, wshape, st, pd, precision)
         if gw is not None:
             return gw

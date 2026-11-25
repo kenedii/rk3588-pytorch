@@ -74,7 +74,7 @@ struct wc_entry {
 
 /* B(k = l, n = (c, ky, kx)) of one image = x[c][oy*sy - pt + ky][ox*sx - pl + kx] (0 outside), l = oy*ow + ox: the
  * im2col matrix of a convolution, gathered while packing instead of materialised. The batch stride sb_b is C*H*W. */
-typedef struct { int C, H, W, kh, kw, sy, sx, pt, pl, oh, ow; } bgat_t;
+typedef struct { int C, H, W, kh, kw, sy, sx, pt, pl, oh, ow, nimg; } bgat_t;   /* k = (image, oy, ox): nimg images in one GEMM */
 
 struct rk_ctx {
 	int      fd;
@@ -168,7 +168,7 @@ rk_ctx *rk_open(const char *dev) {
 	ctx->max_n = env_int("RKNPU_MAX_N", 4096);
 	ctx->timeout_ms = env_int("RKNPU_TIMEOUT_MS", 3000);
 	ctx->reuse = env_int("RKNPU_WEIGHT_REUSE", 1);
-	ctx->conv_out16 = env_int("RKNPU_CONV_OUT16", 0);
+	ctx->conv_out16 = env_int("RKNPU_CONV_OUT16", 1);
 	ctx->pingpong = env_int("RKNPU_PINGPONG", 1);
 	ctx->kplan = env_int("RKNPU_KPLAN", 1);
 	ctx->plan_peak_gmacs = env_int("RKNPU_PLAN_GMACS", 680);   /* 3-core fp16 MAC rate, measured */
@@ -226,7 +226,7 @@ void   rk_set_wcache_mb(rk_ctx *ctx, int mb) { ctx->wc_max = (size_t)(mb > 0 ? m
 void   rk_set_wcache_key(rk_ctx *ctx, uint64_t key) { ctx->wc_key = key; }
 void   rk_set_bgather(rk_ctx *ctx, const int *p) {
 	if (!p) { ctx->bg_on = 0; return; }
-	ctx->bg = (bgat_t){ p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10] };
+	ctx->bg = (bgat_t){ p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11] > 0 ? p[11] : 1 };
 	ctx->bg_on = 1;
 }
 void   rk_set_epilogue(rk_ctx *ctx, const float *bias, int relu) { ctx->epi_bias = bias; ctx->epi_relu = relu; }
@@ -1010,11 +1010,24 @@ DEFINE_PACK_B(pack_b_i8_range, int8_t, 32, CONV_I8)
 #undef FASTCALL
 #undef FAST
 
+/* n floats -> fp16 / bf16 (times sc) */
+static inline void cvt_run(uint16_t *dst, const float *src, int n, float sc, int bf) {
+	int i = 0;
+#if HAVE_NEON8
+	for (; i + 8 <= n; i += 8) vst1q_u16(dst + i, bf ? cvt8_bf16(src + i, sc) : cvt8_f16(src + i, sc));
+#endif
+	for (; i < n; i++) {
+		float v = src[i] * sc;
+		if (bf) dst[i] = f32_to_bf16(v);
+		else { f16 h = (f16)v; memcpy(dst + i, &h, 2); }
+	}
+}
+
 /* B gathered from x (J->bg): same packed layout as the generic branch above, any dtype */
 static void pack_b_gather_range(void *v, int b, int e) {
 	job_t *J = v;
 	const bgat_t *g = J->bg;
-	const int Kc = J->Kc, Nc = J->Nc, K = J->K, N = J->N, G = J->cv == CV_I8 ? 32 : 16, khw = g->kh * g->kw;
+	const int Kc = J->Kc, Nc = J->Nc, K = J->K, N = J->N, G = 16, khw = g->kh * g->kw;
 	for (int it = b; it < e; it++) {
 		int jc = it / (Nc / G), ng = it % (Nc / G);
 		int j = jc / J->nn, c = jc % J->nn;
@@ -1025,23 +1038,48 @@ static void pack_b_gather_range(void *v, int b, int e) {
 			const float *plane = NULL;
 			int ky = 0, kx = 0;
 			if (gn < N) {
-				plane = J->B + (size_t)(gn / khw) * g->H * g->W;
+				plane = J->B + (size_t)(gn / khw) * g->H * g->W;      /* image 0; stepped per image below */
 				ky = (gn % khw) / g->kw; kx = gn % g->kw;
 			}
 			for (int cb = 0; cb < Kc / 32; cb++) {
 				size_t d = base + (size_t)cb * 32 * G + (size_t)nr * 32;
 				int k0 = j * Kc + cb * 32;
-				if (!plane || k0 >= K) { for (int t = 0; t < 32; t++) store_el(J->cv, J->bp, d + t, 0.f); continue; }
-				int oy = k0 / g->ow, ox = k0 % g->ow;
-				for (int t = 0; t < 32; t++) {
-					float x = 0.f;
-					if (k0 + t < K) {
-						int iy = oy * g->sy - g->pt + ky, ix = ox * g->sx - g->pl + kx;
-						if ((unsigned)iy < (unsigned)g->H && (unsigned)ix < (unsigned)g->W) x = plane[(size_t)iy * g->W + ix];
-						if (++ox == g->ow) { ox = 0; oy++; }
+				if (!plane || k0 >= K) { memset((uint16_t *)J->bp + d, 0, 64); continue; }
+				const size_t img = (size_t)g->C * g->H * g->W, L = (size_t)g->oh * g->ow;
+				int im = (int)(k0 / L), l0 = (int)(k0 % L);
+				const float *pl_ = plane + (size_t)im * img;
+				int oy = l0 / g->ow, ox = l0 % g->ow;
+				uint16_t *dp = (uint16_t *)J->bp + d;
+				const int kend = K - k0 < 32 ? K - k0 : 32;
+				int t = 0;
+				while (t < kend) {
+					int run = g->ow - ox < kend - t ? g->ow - ox : kend - t;
+					int iy = oy * g->sy - g->pt + ky;
+					if ((unsigned)iy >= (unsigned)g->H) {
+						memset(dp + t, 0, (size_t)run * 2);
+					} else {
+						const float *row = pl_ + (size_t)iy * g->W;
+						if (g->sx == 1) {            /* contiguous in x: zeros | converted copy | zeros */
+							int ix0 = ox - g->pl + kx;
+							int lo = ix0 < 0 ? -ix0 : 0, hi = g->W - ix0;
+							if (lo > run) lo = run;
+							if (hi > run) hi = run;
+							if (hi < lo) hi = lo;
+							if (lo) memset(dp + t, 0, (size_t)lo * 2);
+							cvt_run(dp + t + lo, row + ix0 + lo, hi - lo, J->b_scale, J->cv == CV_BF16);
+							if (run > hi) memset(dp + t + hi, 0, (size_t)(run - hi) * 2);
+						} else {
+							for (int r = 0; r < run; r++) {
+								int ix = (ox + r) * g->sx - g->pl + kx;
+								float x = (unsigned)ix < (unsigned)g->W ? row[ix] : 0.f;
+								cvt_run(dp + t + r, &x, 1, J->b_scale, J->cv == CV_BF16);
+							}
+						}
 					}
-					store_el(J->cv, J->bp, d + t, J->cv == CV_I8 ? x * J->b_col[gn] : x * J->b_scale);
+					t += run; ox += run;
+					if (ox == g->ow) { ox = 0; if (++oy == g->oh) { oy = 0; pl_ += img; } }
 				}
+				if (kend < 32) memset(dp + kend, 0, (size_t)(32 - kend) * 2);
 			}
 		}
 	}
@@ -1193,9 +1231,11 @@ static void amax_b_cols(void *v, int b, int e) {
 			for (int n = n0; n < n1; n++) {
 				if (n / khw != last) {
 					last = n / khw;
-					const uint32_t *s = (const uint32_t *)(J->B + (size_t)last * hw);
 					m = 0;
-					for (size_t i = 0; i < hw; i++) { uint32_t a = s[i] & 0x7fffffffu; m = a > m ? a : m; }
+					for (int im = 0; im < J->bg->nimg; im++) {
+						const uint32_t *s = (const uint32_t *)(J->B + (size_t)im * J->bg->C * hw + (size_t)last * hw);
+						for (size_t i = 0; i < hw; i++) { uint32_t a = s[i] & 0x7fffffffu; m = a > m ? a : m; }
+					}
 				}
 				mx[n] = m;
 			}
@@ -1740,7 +1780,7 @@ static int gemm_front(rk_ctx *ctx, int prec, int batch, int M, int N, int K,
 		set_err(ctx, "implicit im2col supports fp16 / bf16 only");
 		return -1;
 	}
-	if (J.bg && (K != J.bg->oh * J.bg->ow || N != J.bg->C * J.bg->kh * J.bg->kw)) {
+	if (J.bg && (K != J.bg->nimg * J.bg->oh * J.bg->ow || N != J.bg->C * J.bg->kh * J.bg->kw)) {
 		set_err(ctx, "implicit im2col: shape mismatch");
 		return -1;
 	}
@@ -2375,7 +2415,7 @@ int rk_conv2d_ex(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float 
 		 * A new group (bb == 0 && sl == 0) brings new weights. */
 		int dbanks = dbanks_all;
 		size_t xo = (size_t)gr * J.x_grp + (size_t)bb * J.x_img + (size_t)j * J.x_chunk + (size_t)in0 * W * 8;
-		size_t yo = (size_t)gr * J.y_grp + (size_t)bb * J.y_img + (size_t)j * J.y_chunk + (size_t)r0 * ow * 4;
+		size_t yo = (size_t)gr * J.y_grp + (size_t)bb * J.y_img + (size_t)j * J.y_chunk + (size_t)r0 * ow * (out16 ? 8 : 4);   /* elements per output atom */
 		task_desc d = {
 			.dt = dt, .m = in_rows, .k = Cc, .n = Op, .grains = in_rows + 1,
 			.dbanks = dbanks, .wbanks = CBUF_BANKS - dbanks,
