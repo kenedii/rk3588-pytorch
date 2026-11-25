@@ -124,6 +124,9 @@ int rk_conv2d_grouped(rk_ctx *ctx, int prec, int N, int C, int H, int W, const f
  * y = relu?(y + bias), bias indexed by output column (GEMM) or output channel (conv);
  * bias = NULL for none. The ReLU runs in the NPU's DPU when nothing is added afterwards. */
 void rk_set_epilogue(rk_ctx *ctx, const float *bias, int relu);
+/* p = {C,H,W,kh,kw,sy,sx,pt,pl,oh,ow} (or NULL to clear): rk_gemm_batched then reads B[b] (K=oh*ow x N=C*kh*kw) as the
+ * im2col of image b of x (fp32 NCHW, passed as B; sb_b = C*H*W). fp16 / bf16 only. */
+void rk_set_bgather(rk_ctx *ctx, const int *p);
 
 /* Packed-weight cache. While a nonzero key is set, the weight operand (GEMM B, conv
  * weights) of the following calls is packed once into a dedicated NPU buffer under that key
@@ -144,6 +147,8 @@ typedef struct {
 	int layout;             /* 0 = row-major (NHWC) attempt, 1 = NC1HWC2 */
 	int dw;                 /* depthwise (w_bytes = one kernel per channel) */
 	int relu;               /* DPU ReLU */
+	int out16;              /* fp16 output (default fp32) */
+	int surf_add;           /* with out16: DPU_SURFACE_ADD multiplier override (0 = the dtype's own) */
 } rk_conv_cfg;
 int rk_conv_raw(rk_ctx *ctx, const rk_conv_cfg *cfg, const void *in_nhwc, const void *w_bytes, void *out_nhwc);
 

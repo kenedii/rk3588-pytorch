@@ -14,7 +14,7 @@ from rk3588_torch._lib import default_npu  # noqa: E402
 
 class Cfg(ctypes.Structure):
     _fields_ = [(n, ctypes.c_int) for n in ("h", "w", "c", "n", "kh", "kw", "sy", "sx", "pt", "pl", "oh", "ow",
-                                            "grains", "dbanks", "layout")]
+                                            "grains", "dbanks", "layout", "dw", "relu", "out16", "surf_add")]
 
 
 npu = default_npu()

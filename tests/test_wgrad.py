@@ -28,8 +28,9 @@ def case(name, N, C, H, O, k, st, pd, groups=1, prec="fp16", bias=False, chunk=N
     w = torch.randn(O, C // groups, k, k) * 0.2
     b = torch.randn(O) if bias else None
     res = {}
-    for mode in ("copy", "batched", "auto"):
-        ops.DW_MODE = mode
+    for mode in ("copy", "batched", "batched_unfold", "auto"):
+        ops.DW_IM2COL = "0" if mode in ("batched_unfold", "copy") else "1"      # "batched" = implicit im2col in the engine
+        ops.DW_MODE = "batched" if mode == "batched_unfold" else mode
         ops.DW_CHUNK_ELEMS = chunk if chunk else 32 * (1 << 20) // 4
         xr, wr = x.clone().requires_grad_(), w.clone().requires_grad_()
         br = b.clone().requires_grad_() if bias else None
@@ -46,7 +47,7 @@ def case(name, N, C, H, O, k, st, pd, groups=1, prec="fp16", bias=False, chunk=N
     ok = max(errs.values()) < tol
     # the two layouts must agree with each other much more tightly than with the CPU (same NPU arithmetic, only
     # the partial-sum grouping differs)
-    ok = ok and rel(res["batched"][0], res["copy"][0]) < 2e-3
+    ok = ok and rel(res["batched"][0], res["copy"][0]) < 2e-3 and rel(res["batched"][0], res["batched_unfold"][0]) < 1e-3
     ok = ok and all(rel(r[1], xc.grad) < tol for r in res.values())
     if bias:
         ok = ok and all(rel(r[2], bc.grad) < 1e-5 for r in res.values())
