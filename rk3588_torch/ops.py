@@ -848,13 +848,76 @@ DW_RATIO = float(os.environ.get("RKNPU_DW_RATIO", "2"))
 DW_CHUNK_ELEMS = int(os.environ.get("RKNPU_DW_CHUNK_MB", "32")) * (1 << 20) // 4     # partial dW results per call
 
 
+# RKNPU_DW_IM2COL = 0 | 1: let the GEMM engine gather the im2col operand straight from x while packing it (no fp32
+# unfold matrix) for the batched weight-gradient GEMMs. Off by default: 8-25% faster per GEMM in isolation, but no
+# consistent gain in a training step (see docs/12_session4_findings.md).
+DW_IM2COL = os.environ.get("RKNPU_DW_IM2COL", "0")
+_im2col_bad = set()
+
+
+def _wgrad_sample_ok(x, g, gw, wshape, st, pd, n=4):
+    """Spot-check a few weight-gradient entries against fp64 (error bounded by the sum of |terms|)."""
+    O, Cg, kh, kw = wshape
+    oh, ow = g.shape[2:]
+    xp = torch.nn.functional.pad(x, (pd[1], pd[1], pd[0], pd[0])) if (pd[0] or pd[1]) else x
+    gen = torch.Generator().manual_seed(len(_im2col_bad) + oh * ow)
+    for _ in range(n):
+        o = int(torch.randint(O, (1,), generator=gen)); c = int(torch.randint(Cg, (1,), generator=gen))
+        ky = int(torch.randint(kh, (1,), generator=gen)); kx = int(torch.randint(kw, (1,), generator=gen))
+        xs = xp[:, c, ky:ky + st[0] * (oh - 1) + 1:st[0], kx:kx + st[1] * (ow - 1) + 1:st[1]].double()
+        t = g[:, o].double() * xs
+        ref, bound = t.sum().item(), t.abs().sum().item()
+        if abs(gw[o, c * kh * kw + ky * kw + kx].item() - ref) > 5e-3 * bound + 1e-30:
+            return False
+    return True
+
+
+def _conv_wgrad_im2col(x, g, wshape, st, pd, precision):
+    """dW = sum_b g_b @ im2col(x_b)^T with the im2col gathered inside the GEMM engine. None if not applicable."""
+    O, Cg, kh, kw = wshape
+    N, C, H, W = x.shape
+    oh, ow = g.shape[2:]
+    L, CK = oh * ow, Cg * kh * kw
+    if precision not in ("fp16", "bf16") or x.dtype != torch.float32 or g.dtype != torch.float32:
+        return None
+    key = (C, H, W, O, kh, kw, st, pd)
+    if key in _im2col_bad:
+        return None
+    xc, gc = x.contiguous(), g.contiguous()
+    gm = gc.reshape(N, O, L)
+    nb = max(1, min(N, DW_CHUNK_ELEMS // max(1, O * CK)))
+    acc = None
+    npu = default_npu()
+    for i in range(0, N, nb):
+        m = min(nb, N - i)
+        out = torch.empty((m, O, CK), dtype=torch.float32)
+        npu.gemm(m, O, CK, L, gm.data_ptr() + i * O * L * 4, O * L, L, 1, xc.data_ptr() + i * C * H * W * 4,
+                 C * H * W, 0, 0, out.data_ptr(), O * CK, CK, False, precision,
+                 bgather=(C, H, W, kh, kw, st[0], st[1], pd[0], pd[1], oh, ow))
+        part = out.sum(0) if m > 1 else out[0]
+        acc = part if acc is None else acc.add_(part)
+    _stats["npu_calls"] += 1
+    _stats["npu_macs"] += N * O * CK * L
+    if VERIFY != "off" and not _wgrad_sample_ok(xc, gc, acc, wshape, st, pd):
+        _im2col_bad.add(key)
+        warnings.warn("rk3588_torch: implicit-im2col weight gradient failed its check for %s; using unfold" % (key,),
+                      RuntimeWarning)
+        return None
+    return acc.reshape(O, Cg, kh, kw)
+
+
 def _conv_weight_grad(x, g, wshape, st, pd, G, precision):
     O, Cg, kh, kw = wshape
     N, C = x.shape[:2]
     Og = O // G
-    cols = torch.nn.functional.unfold(x.float(), (kh, kw), padding=pd, stride=st)       # N, C*kh*kw, L
-    L = cols.shape[2]
+    L = g.shape[2] * g.shape[3]
     CK = Cg * kh * kw
+    batched = G == 1 and (DW_MODE == "batched" or (DW_MODE == "auto" and L >= DW_MIN_L and L >= DW_RATIO * O))
+    if batched and DW_IM2COL not in ("0", "off"):
+        gw = _conv_wgrad_im2col(x.float(), g, wshape, st, pd, precision)
+        if gw is not None:
+            return gw
+    cols = torch.nn.functional.unfold(x.float(), (kh, kw), padding=pd, stride=st)       # N, C*kh*kw, L
     if G == 1 and (DW_MODE == "batched" or (DW_MODE == "auto" and L >= DW_MIN_L and L >= DW_RATIO * O)):
         gm = g.reshape(N, O, L)
         nb = max(1, min(N, DW_CHUNK_ELEMS // max(1, O * CK)))
