@@ -152,7 +152,18 @@ typedef struct {
 } rk_conv_cfg;
 int rk_conv_raw(rk_ctx *ctx, const rk_conv_cfg *cfg, const void *in_nhwc, const void *w_bytes, void *out_nhwc);
 
+/* Training-mode BatchNorm on the CPU (NCHW fp32; N batches x C channels x HW contiguous elements).
+ * op 0 forward: y = (x - mean) * rstd * gamma + beta; writes mean, rstd = 1/sqrt(var + eps) and var (biased),
+ *               gamma / beta may be NULL.
+ * op 1 backward: dx (y, may be NULL) from g, x, gamma (or NULL), mean_in, rstd_in; dgamma / dbeta (or NULL). */
+int rk_batchnorm(rk_ctx *ctx, int op, const float *x, const float *g, const float *gamma, const float *beta,
+                 const float *mean_in, const float *rstd_in, float *y, float *mean, float *rstd, float *var,
+                 float *dgamma, float *dbeta, int N, int C, int HW, float eps);
+
 #ifdef __cplusplus
 }
 #endif
+
+
+
 #endif

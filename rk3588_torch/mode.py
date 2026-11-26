@@ -4,9 +4,8 @@
         loss = model(x).sum()
         loss.backward()
 
-Inside the context, F.linear, matmul / mm / bmm / addmm / baddbmm, two-operand
-torch.einsum, F.scaled_dot_product_attention, F.multi_head_attention_forward (nn.MultiheadAttention,
-nn.Transformer*), F.conv1d / F.conv2d and F.conv_transpose2d
+Inside the context, F.linear, matmul / mm / bmm / addmm / baddbmm, torch.einsum (any operand count, `...`, implicit output), F.scaled_dot_product_attention, F.multi_head_attention_forward (nn.MultiheadAttention,
+nn.Transformer*), F.conv1d / F.conv2d / F.conv3d and F.conv_transpose2d
 on CPU float tensors run on the NPU (forward and backward); every other op stays on the
 CPU. Convolutions use the NPU's native convolution engine (dilated ones via space-to-batch; grouped convolutions
 when the groups aren't too thin; depthwise ones run in the library's NEON CPU kernels). Biases are added in the
@@ -20,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch.overrides import TorchFunctionMode
 
-from . import eltwise, ops, rnn
+from . import bnorm, eltwise, ops, rnn
 
 _MM_FUNCS = {torch.mm, torch.Tensor.mm, torch.matmul, torch.Tensor.matmul, torch.Tensor.__matmul__}
 _BMM_FUNCS = {torch.bmm, torch.Tensor.bmm}
@@ -29,6 +28,7 @@ _BADDBMM_FUNCS = {torch.baddbmm, torch.Tensor.baddbmm}
 _SDPA = getattr(F, "scaled_dot_product_attention", None)
 _EINSUM = {torch.einsum, torch.functional.einsum} if hasattr(torch, "functional") else {torch.einsum}
 _MHA_SIG = inspect.signature(F.multi_head_attention_forward)
+_BN_SIG = inspect.signature(F.batch_norm)
 
 
 def _gelu(args, kw):
@@ -198,6 +198,13 @@ class NPUMode(TorchFunctionMode):
     def _route(self, func, args, kwargs):
         if func in _ELTWISE and eltwise.ENABLED:
             return _ELTWISE[func](args, kwargs)
+        if func is F.batch_norm and bnorm.ENABLED:
+            try:
+                a = _BN_SIG.bind(*args, **kwargs).arguments
+            except TypeError:
+                return None
+            return bnorm.batch_norm(a["input"], a.get("running_mean"), a.get("running_var"), a.get("weight"),
+                                    a.get("bias"), a.get("training", False), a.get("momentum", 0.1), a.get("eps", 1e-5))
         if self.linear and func is F.linear:
             x, w = args[0], args[1]
             b = args[2] if len(args) > 2 else kwargs.get("bias")
@@ -266,6 +273,16 @@ class NPUMode(TorchFunctionMode):
                 return fn(x, w, b, params.get("stride", 1), params.get("padding", 0),
                           params.get("dilation", 1), params.get("groups", 1))
             return None
+        if self.conv and func is F.conv3d:
+            x, w = args[0], args[1]
+            names = ["bias", "stride", "padding", "dilation", "groups"]
+            params = dict(zip(names, args[2:]))
+            params.update(kwargs)
+            b = params.get("bias")
+            if _tensors_ok(x, w) and (b is None or _tensors_ok(b)):
+                return ops.conv3d(x, w, b, params.get("stride", 1), params.get("padding", 0),
+                                  params.get("dilation", 1), params.get("groups", 1))
+            return None
         if self.conv and func is F.conv_transpose2d:
             x, w = args[0], args[1]
             names = ["bias", "stride", "padding", "output_padding", "groups", "dilation"]
@@ -281,7 +298,7 @@ class NPUMode(TorchFunctionMode):
             eq, ops_ = (args[0], args[1:]) if args and isinstance(args[0], str) else (None, ())
             if len(ops_) == 1 and isinstance(ops_[0], (list, tuple)):
                 ops_ = tuple(ops_[0])
-            if eq is not None and len(ops_) == 2 and _tensors_ok(*ops_):
+            if eq is not None and len(ops_) >= 2 and _tensors_ok(*ops_):
                 if _big_enough(ops.einsum_macs(eq, *ops_)):
                     return ops.einsum(eq, *ops_)
             return None
@@ -371,8 +388,11 @@ class NPUConv2d(torch.nn.Conv2d):
     fused_relu = False
 
     def forward(self, x):
-        if self.padding_mode == "zeros" and ops._enabled and ops._usable(x, self.weight) and x.dim() == 4:
-            y = ops.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups,
+        if ops._enabled and ops._usable(x, self.weight) and x.dim() == 4:
+            xin, pad = x, self.padding
+            if self.padding_mode != "zeros":       # reflect / replicate / circular: pad on the CPU, convolve unpadded
+                xin, pad = F.pad(x, self._reversed_padding_repeated_twice, mode=self.padding_mode), 0
+            y = ops.conv2d(xin, self.weight, self.bias, self.stride, pad, self.dilation, self.groups,
                            "relu" if self.fused_relu else None)
             if y is not None:
                 return y
@@ -385,13 +405,30 @@ class NPUConv1d(torch.nn.Conv1d):
     fused_relu = False
 
     def forward(self, x):
-        if self.padding_mode == "zeros" and ops._enabled and ops._usable(x, self.weight):
-            y = ops.conv1d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups,
+        if ops._enabled and ops._usable(x, self.weight):
+            xin, pad = x, self.padding
+            if self.padding_mode != "zeros":
+                xin, pad = F.pad(x, self._reversed_padding_repeated_twice, mode=self.padding_mode), 0
+            y = ops.conv1d(xin, self.weight, self.bias, self.stride, pad, self.dilation, self.groups,
                            "relu" if self.fused_relu else None)
             if y is not None:
                 return y
         y = super().forward(x)
         return F.relu(y) if self.fused_relu else y
+
+
+class NPUConv3d(torch.nn.Conv3d):
+    """nn.Conv3d on the NPU (kd depth taps stacked along the channels of one 2-D convolution)."""
+
+    def forward(self, x):
+        if ops._enabled and ops._usable(x, self.weight) and x.dim() in (4, 5):
+            xin, pad = x, self.padding
+            if self.padding_mode != "zeros":
+                xin, pad = F.pad(x, self._reversed_padding_repeated_twice, mode=self.padding_mode), 0
+            y = ops.conv3d(xin, self.weight, self.bias, self.stride, pad, self.dilation, self.groups)
+            if y is not None:
+                return y
+        return super().forward(x)
 
 
 class NPUConvTranspose2d(torch.nn.ConvTranspose2d):
@@ -407,6 +444,39 @@ class NPUConvTranspose2d(torch.nn.ConvTranspose2d):
         return super().forward(x, output_size)
 
 
+class _NPUBatchNormMixin:
+    """BatchNorm1d/2d/3d whose training-mode forward uses the fused CPU kernel (works without npu_mode)."""
+
+    def forward(self, x):
+        self._check_input_dim(x)
+        eaf = 0.0 if self.momentum is None else self.momentum
+        if self.training and self.track_running_stats and self.num_batches_tracked is not None:
+            self.num_batches_tracked.add_(1)
+            eaf = 1.0 / float(self.num_batches_tracked) if self.momentum is None else self.momentum
+        use_batch = self.training or (self.running_mean is None and self.running_var is None)
+        if use_batch and ops._enabled:
+            y = bnorm.batch_norm(x, self.running_mean if not self.training or self.track_running_stats else None,
+                                 self.running_var if not self.training or self.track_running_stats else None,
+                                 self.weight, self.bias, True, eaf, self.eps)
+            if y is not None:
+                return y
+        return F.batch_norm(x, self.running_mean if not self.training or self.track_running_stats else None,
+                            self.running_var if not self.training or self.track_running_stats else None,
+                            self.weight, self.bias, use_batch, eaf, self.eps)
+
+
+class NPUBatchNorm1d(_NPUBatchNormMixin, torch.nn.BatchNorm1d):
+    pass
+
+
+class NPUBatchNorm2d(_NPUBatchNormMixin, torch.nn.BatchNorm2d):
+    pass
+
+
+class NPUBatchNorm3d(_NPUBatchNormMixin, torch.nn.BatchNorm3d):
+    pass
+
+
 class _FusedReLU(torch.nn.Module):
     """Placeholder for a ReLU that convert() folded into the preceding NPU layer."""
 
@@ -418,6 +488,8 @@ class _FusedReLU(torch.nn.Module):
 
 
 _SWAP = {torch.nn.Linear: NPULinear, torch.nn.Conv2d: NPUConv2d, torch.nn.Conv1d: NPUConv1d,
+         torch.nn.Conv3d: NPUConv3d, torch.nn.BatchNorm1d: NPUBatchNorm1d, torch.nn.BatchNorm2d: NPUBatchNorm2d,
+         torch.nn.BatchNorm3d: NPUBatchNorm3d,
          torch.nn.ConvTranspose2d: NPUConvTranspose2d, torch.nn.LSTM: rnn.NPULSTM, torch.nn.GRU: rnn.NPUGRU}
 _FUSABLE = (NPULinear, NPUConv2d, NPUConv1d)
 
