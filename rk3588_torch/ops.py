@@ -13,6 +13,7 @@ Every call is guarded so that training can't be broken by the NPU:
   * NPU errors fall back to the CPU, and after repeated errors the NPU is disabled.
 """
 import math
+import string
 import os
 import threading
 import time
@@ -620,10 +621,9 @@ def _parse_einsum(eq, nd_a, nd_b):
     return ia, ib, out
 
 
-def einsum(eq, a, b):
-    """torch.einsum(eq, a, b) as permute/reshape + one NPU (batched) matmul + permute.
-    Returns None for what it doesn't handle (ellipsis, repeated indices, broadcasting, other
-    operand counts); those stay on the CPU."""
+def _einsum2(eq, a, b):
+    """Two-operand torch.einsum with explicit output and no ellipsis, as permute/reshape + one NPU (batched)
+    matmul + permute. Returns None for what it doesn't handle (repeated indices, broadcasting)."""
     p = _parse_einsum(eq, a.dim(), b.dim())
     if p is None:
         return None
@@ -656,14 +656,85 @@ def einsum(eq, a, b):
     return y.permute([order.index(c) for c in out])
 
 
-def einsum_macs(eq, a, b):
-    p = _parse_einsum(eq, a.dim(), b.dim())
-    if p is None:
-        return 0
-    ia, ib, _ = p
-    size = dict(zip(ia, a.shape))
-    size.update(zip(ib, b.shape))
-    return math.prod(size.values())
+def _normalize_einsum(eq, shapes):
+    """Explicit-output, ellipsis-free form of an einsum equation: ([index string per operand], output string,
+    {index: size}). Handles "...", implicit output (alphabetical, like torch) and any operand count; None if the
+    equation is malformed, has repeated indices in an operand, or needs broadcasting."""
+    eq = eq.replace(" ", "")
+    lhs, arrow, out = eq.partition("->")
+    ins = lhs.split(",")
+    if len(ins) != len(shapes) or any(s.count("...") > 1 for s in ins + [out]):
+        return None
+    used = {c for s in ins + [out] for c in s.replace("...", "")}
+    if not all(c.isalpha() and c.isascii() for c in used):
+        return None
+    free = [c for c in string.ascii_letters if c not in used]
+    nell = 0
+    for s, shp in zip(ins, shapes):
+        if "..." in s:
+            pre, post = s.split("...")
+            if len(shp) < len(pre) + len(post):
+                return None
+            nell = max(nell, len(shp) - len(pre) - len(post))
+        elif len(s) != len(shp):
+            return None
+    if nell > len(free):
+        return None
+    ell = "".join(free[:nell])
+    new = []
+    for s, shp in zip(ins, shapes):
+        if "..." in s:
+            pre, post = s.split("...")
+            k = len(shp) - len(pre) - len(post)
+            s = pre + ell[nell - k:] + post
+        new.append(s)
+    if arrow:
+        out = out.replace("...", ell)
+    else:
+        once = sorted(c for c in {c for s in new for c in s} if sum(s.count(c) for s in new) == 1 and c not in ell)
+        out = ell + "".join(once)
+    size = {}
+    for s, shp in zip(new, shapes):
+        if len(set(s)) != len(s):
+            return None
+        for c, n in zip(s, shp):
+            if size.setdefault(c, n) != n:
+                return None                       # broadcasting (size 1 vs n): leave to the CPU
+    if len(set(out)) != len(out) or not set(out) <= set(size):
+        return None
+    return new, out, size
+
+
+def einsum(eq, *operands):
+    """torch.einsum on the NPU for any number of operands: contracted pairwise, left to right, each pair as one
+    (batched) NPU matmul (_einsum2). Handles "...", implicit outputs and summed-out indices. Returns None for
+    what it doesn't handle (repeated indices within an operand, broadcasting, a single operand); those stay on
+    the CPU."""
+    if len(operands) < 2:
+        return None
+    n = _normalize_einsum(eq, [t.shape for t in operands])
+    if n is None:
+        return None
+    ins, out, _ = n
+    cur = list(zip(ins, operands))
+    while len(cur) > 1:
+        (ia, a), (ib, b), rest = cur[0], cur[1], cur[2:]
+        if rest:
+            needed = set(out) | {c for idx, _ in rest for c in idx}
+            keep = "".join(c for c in dict.fromkeys(ia + ib) if c in needed)
+        else:
+            keep = out
+        r = _einsum2(f"{ia},{ib}->{keep}", a, b)
+        if r is None:
+            return None
+        cur = [(keep, r)] + rest
+    return cur[0][1]
+
+
+def einsum_macs(eq, *operands):
+    """Multiply-adds of the contraction (product of every index size; 0 if einsum() won't handle it)."""
+    n = _normalize_einsum(eq, [t.shape for t in operands]) if len(operands) >= 2 else None
+    return 0 if n is None else math.prod(n[2].values())
 
 
 # ---------------------------------------------------------------------------------------
@@ -1105,6 +1176,44 @@ def conv1d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, act=
         return None
     y = y.squeeze(3)
     return y.squeeze(0) if unbatched else y
+
+
+def _triple(v):
+    return tuple(v) if isinstance(v, (tuple, list)) and len(v) == 3 else (v,) * 3 if isinstance(v, int) else None
+
+
+def conv3d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+    """F.conv3d on the NPU as one 2-D convolution: the kd depth taps of every output slice are stacked along
+    the channel axis, (N, C, D, H, W) -> (N * OD, kd * C, H, W), and run against the weight reshaped to
+    (O, kd * C, kh, kw). That is exactly the 3-D convolution (same multiply-adds), forward and backward,
+    and every 2-D feature of conv2d (padding, stride, dilation, bias) comes along. Costs a kd-times larger
+    input copy, so it is only taken while that stays under RKNPU_IM2COL_MAX_MB. Returns None if unsupported
+    (groups > 1, "same"/"valid" strings, negative padding)."""
+    if x.dim() not in (4, 5) or weight.dim() != 5 or groups != 1 or isinstance(padding, str):
+        return None
+    st, pd, dl = _triple(stride), _triple(padding), _triple(dilation)
+    if st is None or pd is None or dl is None or min(pd) < 0:
+        return None
+    if bias is not None and (bias.dim() != 1 or bias.shape[0] != weight.shape[0]):
+        return None
+    unbatched = x.dim() == 4
+    x5 = x.unsqueeze(0) if unbatched else x
+    N, C, D, H, W = x5.shape
+    O, Cw, kd, kh, kw = weight.shape
+    if Cw != C:
+        return None
+    OD = (D + 2 * pd[0] - dl[0] * (kd - 1) - 1) // st[0] + 1
+    if OD < 1 or kd * x5.numel() > IM2COL_MAX_ELEMS:
+        return None
+    xp = torch.nn.functional.pad(x5, (0, 0, 0, 0, pd[0], pd[0])) if pd[0] else x5
+    taps = [xp[:, :, i * dl[0]: i * dl[0] + st[0] * (OD - 1) + 1: st[0]] for i in range(kd)]   # each (N, C, OD, H, W)
+    xin = (taps[0] if kd == 1 else torch.cat(taps, dim=1)).permute(0, 2, 1, 3, 4).reshape(N * OD, kd * C, H, W)
+    w2 = weight.permute(0, 2, 1, 3, 4).reshape(O, kd * C, kh, kw)
+    y = conv2d(xin, w2, bias, st[1:], pd[1:], dl[1:], 1)
+    if y is None:
+        return None
+    y = y.reshape(N, OD, O, y.shape[-2], y.shape[-1]).permute(0, 2, 1, 3, 4)
+    return y.squeeze(0) if unbatched else y.contiguous()
 
 
 def conv_transpose2d(x, weight, bias=None, stride=1, padding=0, output_padding=0, groups=1, dilation=1):

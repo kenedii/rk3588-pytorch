@@ -124,8 +124,9 @@ for eq, sa, sb in [("ij,jk->ik", (64, 48), (48, 80)), ("bij,bjk->bik", (4, 32, 4
                    ("i j , j k -> k i", (40, 50), (50, 60))]:
     grads(f"einsum '{eq}'", lambda a, b, eq=eq: ops.einsum(eq, a, b), lambda a, b, eq=eq: torch.einsum(eq, a, b),
           sa, sb)
-flag("einsum with '...' is left to torch", ops.einsum("...ij,...jk->...ik", torch.randn(2, 3, 4),
-                                                       torch.randn(2, 4, 5)) is None)
+grads("einsum with '...'", lambda a, b: ops.einsum("...ij,...jk->...ik", a, b),
+      lambda a, b: torch.einsum("...ij,...jk->...ik", a, b), (2, 3, 4), (2, 4, 5))
+flag("einsum with a repeated index is left to torch", ops.einsum("ii,ij->j", torch.randn(4, 4), torch.randn(4, 5)) is None)
 
 # ---- routing through npu_mode -------------------------------------------------------------
 x = torch.randn(8, 16, 64)

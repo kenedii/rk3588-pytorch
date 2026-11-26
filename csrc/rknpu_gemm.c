@@ -2433,3 +2433,4 @@ int rk_conv2d(rk_ctx *ctx, int prec, int N, int C, int H, int W, const float *x,
 
 #include "rknpu_eltwise.c"
 #include "rknpu_dwconv.c"
+#include "rknpu_bnorm.c"

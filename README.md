@@ -41,7 +41,7 @@ optimizer.step()                       # everything else stays on the CPU
 | 🔌 **Drop-in** | no model conversion, no RKNN runtime, no changes to your model code |
 | 🎚️ **Five precisions** | fp16, bf16, int8, fp16-output, and an fp32-accurate split mode (~1e-7 error) |
 | 🧠 **All three NPU cores** | work is split across cores automatically |
-| 🧱 **Linear, conv, attention** | `Linear`, native NPU `Conv1d`/`Conv2d`/`ConvTranspose2d` (incl. grouped and dilated), `einsum`, attention, `nn.MultiheadAttention` / `nn.Transformer*`, `bmm`, `torch.compile` |
+| 🧱 **Linear, conv, attention** | `Linear`, native NPU `Conv1d`/`Conv2d`/`Conv3d`/`ConvTranspose2d` (incl. grouped, dilated, all padding modes), n-ary `einsum` (with `...`), fused NEON `BatchNorm`, attention, `nn.MultiheadAttention` / `nn.Transformer*`, `bmm`, `torch.compile` |
 | 🧪 **17 architectures tested** | GPT, Llama-style (RoPE, GQA, SwiGLU), ViT, BERT, seq2seq Transformer, ResNet-18, MobileNet, UNet, DCGAN, TCN, LSTM/GRU, VAE, DLRM, GNN, CLIP-style: all train with CPU-matching gradients (`tests/test_zoo.py`) |
 | 🪶 **Depthwise conv** | NEON CPU kernels replace PyTorch's slow depthwise backward: MobileNet 1.50x → 2.23x |
 | 🔁 **LSTM / GRU** | after `convert()`: input projections, W_hh gradients and large recurrent steps on the NPU, 1.4-5.8x per layer |
@@ -493,6 +493,7 @@ Things that had to be discovered to make this work on a current kernel/driver:
 | `tests/test_ops.py` | GEMM / gradient correctness vs fp64 CPU references |
 | `tests/test_precision.py` | Accuracy and range of every precision mode |
 | `tests/test_conv.py` | Native convolution forward/backward over many geometries (`--bench` for timing) |
+| `tests/test_conv3d.py`, `tests/test_bnorm.py`, `tests/test_einsum_nary.py`, `tests/test_zoo2.py` | conv3d, BatchNorm kernel, n-ary einsum, 14 more architectures (ConvNeXt, MoE, Swin windows, Perceiver, video conv3d, ...) |
 | `tests/test_new_ops.py` | conv1d, conv_transpose2d, grouped conv, einsum, fusion, weight cache (`--fake` runs without an NPU) |
 | `tests/test_llm_finetune.py` | bf16/fp16 frozen weights, bounded conversion memory, gradient checkpointing, weight-cache sizing, duty throttle (`--fake` runs without an NPU) |
 | `tests/test_robust.py` | Fallbacks, verification, batching, attention, `convert()`, `torch.compile`, tools |
@@ -541,6 +542,7 @@ experimenting:
 | `RKNPU_DW_MODE` | `auto` | conv weight gradient: `auto` runs a copy-free batched GEMM on the transposed im2col view when the image has at least `RKNPU_DW_RATIO` (2) x as many positions as output channels and `RKNPU_DW_MIN_L` (256) positions; `copy` / `batched` force one path (`RKNPU_DW_CHUNK_MB`: partial results per call, 32) |
 | `RKNPU_DW_IM2COL` | `0` | `1`: the batched weight-gradient GEMM gathers its im2col operand straight from x while packing (no fp32 unfold matrix; fp16/bf16; spot-checked, falls back to unfold). 8-25% faster per GEMM, no consistent gain per training step |
 | `RKNPU_CONV_OUT16` | `0` | `1`: the NPU writes single-chunk fp16 convolutions' output as fp16 (half the readback; an overflow redoes the call in fp32). ~9% faster per conv in isolation; mixed in-model, and it failed the sample check on 3 MobileNet convs, so experimental |
+| `RKNPU_BNORM` | `1` | training-mode BatchNorm (fp32, contiguous) in the library's fused NEON kernel (`RKNPU_BNORM_MIN`: smallest tensor, 32768 elements; 1.3-2.1x PyTorch's CPU kernel on the tested shapes) |
 | `RKNPU_DWCONV` | `1` | depthwise convolutions in the library's NEON CPU kernels (`RKNPU_DWCONV_MIN`: smallest input, 16384 elements) |
 | `RKNPU_ELTWISE` | `1` | fused NEON GELU / SiLU / RMSNorm kernels under `npu_mode()` and in `convert()` (`RKNPU_ELTWISE_MIN`: smallest tensor, 32768 elements) |
 | `RKNPU_KPLAN` | `1` | choose each GEMM's K split with the DRAM/compute cost model (`0`: one chunk up to `RKNPU_MAX_K`); `RKNPU_PLAN_GMACS` / `_NPU_GBS` / `_CPU_GBS` (680 / 20 / 3) are its constants |
@@ -572,7 +574,7 @@ In Python: `set_precision()`, `set_enabled()`, `release()` (free NPU buffers), `
 | Kernel driver | vendor `rknpu` 0.9.8 (Armbian 6.12, patched build) | other 0.9.x vendor builds (`doctor` reports the version) | mainline `rocket` driver (different uAPI) |
 | OS | Armbian 25.11 (Ubuntu 24.04) | any aarch64 Linux with the driver | |
 | PyTorch | 2.15 CPU wheel | 2.4 or newer | |
-| Ops on the NPU | `linear`, `matmul`/`mm`/`bmm`/`addmm`/`baddbmm`, two-operand `einsum`, `conv1d`/`conv2d`/`conv_transpose2d` (incl. grouped and dilated; zero padding incl. `"same"`), `scaled_dot_product_attention` | | depthwise conv (library NEON kernels), `conv3d`, LSTM/GRU gate math (run on the CPU) |
+| Ops on the NPU | `linear`, `matmul`/`mm`/`bmm`/`addmm`/`baddbmm`, `einsum` (any number of operands, `...` allowed), `conv1d`/`conv2d`/`conv3d`/`conv_transpose2d` (incl. grouped and dilated; zero padding incl. `"same"`; `convert()` also handles reflect/replicate/circular padding modes), `scaled_dot_product_attention` | | depthwise conv and training-mode `BatchNorm` (library NEON kernels), LSTM/GRU gate math (run on the CPU) |
 | Tensors | CPU `float32`, `float16`, `bfloat16` | | CUDA / other devices, integer tensors (left to PyTorch) |
 
 On a non-RK3588 machine the package still installs and everything runs on the CPU, which
@@ -637,12 +639,12 @@ shape; `RKNPU_VERIFY=always` checks every call if you want to be certain.
   as experimental for training.
 * Only GEMM-shaped work runs on the NPU; elementwise ops, norms, softmax, pooling and
   the optimizer stay on the CPU, so small models gain less.
-* Convolutions: zero padding only (`padding_mode="zeros"`). The native NPU convolution takes
+* Convolutions: `convert()`d modules with a non-zero `padding_mode` pad on the CPU first, then convolve on the NPU. The native NPU convolution takes
   feature maps from 5 to 2047 rows/columns; anything else with `groups=1` (smaller maps, longer
   sequences, padding over 15, dilation with an odd stride) runs as unfold + one NPU GEMM if the
   unfolded input fits `RKNPU_IM2COL_MAX_MB`. Grouped convolutions run on the NPU only
   when each group has enough channels (the padding to 32 input / 16 output channels
-  wastes less than 8×); `conv3d` runs on the CPU, and depthwise convolutions (dilation 1) run in the
+  wastes less than 8×); `conv3d` is rewritten as a 2-D convolution over `kd*C` channels (groups=1, input must fit `RKNPU_IM2COL_MAX_MB`; otherwise PyTorch's), and depthwise convolutions (dilation 1) run in the
   library's NEON CPU kernels (`RKNPU_DWCONV=0`: PyTorch's). 7×7 stems on
   3-channel images gain little (the NPU works on 32-channel blocks).
 * `nn.LSTM` / `nn.GRU` use the NPU only after `convert()` (under `npu_mode()` alone they are PyTorch's fused
@@ -650,8 +652,8 @@ shape; `RKNPU_VERIFY=always` checks every call if you want to be certain.
   direction, the W_hh weight gradient in another, and the per-step `h @ W_hh` on the NPU when a step has
   ≥ 30M multiply-adds (`RKNPU_RNN_REC_NPU=auto|1|0`, `RKNPU_RNN_REC_MACS`); the gate math stays on the CPU.
   `PackedSequence` inputs, `proj_size` and unbatched inputs fall back to PyTorch.
-* `einsum`: two operands, no `...` and no repeated indices within an operand; other forms
-  are left to PyTorch.
+* `einsum`: contracted pairwise left to right; repeated indices within one operand and broadcasting
+  of size-1 dims are left to PyTorch.
 * Each NPU call costs ~0.3 ms of CPU-side packing and submission, so many small ops
   (e.g. attention with small heads) stay on the CPU.
 * A job that hangs makes the driver soft-reset all NPU cores, which would also abort
